@@ -6,6 +6,13 @@ from io import BytesIO
 
 
 # --------------------------------------------------
+# Session State Init
+# --------------------------------------------------
+if "sku_df" not in st.session_state:
+    st.session_state.sku_df = None
+
+
+# --------------------------------------------------
 # Helpers
 # --------------------------------------------------
 def to_excel_bytes(df):
@@ -28,7 +35,7 @@ def normalize_headers(df):
 
 
 # --------------------------------------------------
-# Receive Match
+# Receive Match Logic
 # --------------------------------------------------
 def extract_lpns_from_pdfs(pdf_files):
     lpns = set()
@@ -47,17 +54,18 @@ def run_receive_match(excel_file, pdf_files):
     df.columns = df.columns.str.upper().str.strip()
 
     if "PACKAGEID" not in df.columns:
-        raise ValueError("PACKAGEID column not found (row 2 expected)")
+        raise ValueError("PACKAGEID column not found (expected on row 2)")
 
     lpns = extract_lpns_from_pdfs(pdf_files)
 
     df["PDF LPN"] = df["PACKAGEID"].apply(lambda x: x if x in lpns else "")
     df["RECEIVE MATCH"] = df["PACKAGEID"].apply(lambda x: "YES" if x in lpns else "NO")
+
     return df
 
 
 # --------------------------------------------------
-# SKU Adder
+# SKU Adder Logic
 # --------------------------------------------------
 def map_description(grade):
     grade = str(grade).upper()
@@ -73,7 +81,6 @@ def map_description(grade):
 def run_sku_adder(container_raw_df, sku_file):
     container_df = normalize_headers(container_raw_df).fillna("")
 
-    # Load SKU lookup
     xls = pd.ExcelFile(sku_file)
     sku_df = None
     for sheet in xls.sheet_names:
@@ -146,13 +153,12 @@ def generate_sales_assist(df):
 st.set_page_config(page_title="Receive Match + SKU + Sales Assist", layout="wide")
 st.title("📦 Receive Match → SKU Adder → Sales Assist")
 
-# ------------------ Step 1 ------------------
+# ================= Step 1 =================
 st.header("Step 1️⃣ Receive Match Checker")
 
-rm_excel = st.file_uploader("Upload Container Excel (PACKAGEID on row 2)", type="xlsx", key="rm_excel")
-rm_pdfs = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True, key="rm_pdfs")
+rm_excel = st.file_uploader("Upload Container Excel (PACKAGEID on row 2)", type="xlsx")
+rm_pdfs = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True)
 
-rm_df = None
 if rm_excel and rm_pdfs and st.button("Run Receive Match"):
     rm_df = run_receive_match(rm_excel, rm_pdfs)
     st.success("Receive Match completed")
@@ -165,31 +171,35 @@ if rm_excel and rm_pdfs and st.button("Run Receive Match"):
 
 st.divider()
 
-# ------------------ Step 2 ------------------
+# ================= Step 2 =================
 st.header("Step 2️⃣ SKU Adder")
 
-sku_lookup = st.file_uploader("Upload SKU Lookup Excel", type="xlsx", key="sku_lookup")
-sku_input = st.file_uploader("Upload Receive Match Excel (or original)", type="xlsx", key="sku_input")
+sku_lookup = st.file_uploader("Upload SKU Lookup Excel", type="xlsx")
+sku_input = st.file_uploader("Upload Receive Match Excel (or original)", type="xlsx")
 
-sku_df = None
 if sku_lookup and sku_input and st.button("Run SKU Adder"):
     raw_df = pd.read_excel(sku_input, header=None, dtype=str)
-    sku_df = run_sku_adder(raw_df, sku_lookup)
+    st.session_state.sku_df = run_sku_adder(raw_df, sku_lookup)
     st.success("SKU Adder completed")
-    st.dataframe(sku_df.head(50), use_container_width=True)
+
+if st.session_state.sku_df is not None:
+    st.dataframe(st.session_state.sku_df.head(50), use_container_width=True)
     st.download_button(
         "⬇️ Download SKU Added Excel",
-        to_excel_bytes(sku_df),
-        sku_input.name.replace(".xlsx", "_SKU_ADDED.xlsx")
+        to_excel_bytes(st.session_state.sku_df),
+        "SKU_ADDED.xlsx"
     )
 
 st.divider()
 
-# ------------------ Step 3 ------------------
+# ================= Step 3 =================
 st.header("Step 3️⃣ Sales Assist Report")
 
-if sku_df is not None and st.button("Generate Sales Assist Excel"):
-    sa_df = generate_sales_assist(sku_df)
+if st.session_state.sku_df is None:
+    st.info("ℹ️ Run **SKU Adder** first before generating the Sales Assist report.")
+
+if st.session_state.sku_df is not None and st.button("Generate Sales Assist Excel"):
+    sa_df = generate_sales_assist(st.session_state.sku_df)
     st.success("Sales Assist report generated")
     st.dataframe(sa_df.head(50), use_container_width=True)
     st.download_button(
