@@ -6,6 +6,13 @@ from io import BytesIO
 
 
 # --------------------------------------------------
+# Session State Init
+# --------------------------------------------------
+if "processed_df" not in st.session_state:
+    st.session_state.processed_df = None
+
+
+# --------------------------------------------------
 # Helpers
 # --------------------------------------------------
 def to_excel_bytes(df):
@@ -23,6 +30,7 @@ def normalize_headers(df):
             break
     if header_row is None:
         raise ValueError("Could not locate header row containing GRADE")
+
     df.columns = df.iloc[header_row].astype(str).str.strip().str.upper()
     return df.iloc[header_row + 1:].reset_index(drop=True)
 
@@ -79,18 +87,16 @@ def load_sku_lookup(sku_file):
 # Combined Processor
 # --------------------------------------------------
 def process_all(container_file, sku_file, pdf_files):
-    # ----- Container -----
     raw_df = pd.read_excel(container_file, header=None, dtype=str)
     df = normalize_headers(raw_df).fillna("")
 
-    # ----- Receive Match -----
+    # Receive Match
     lpns = extract_lpns_from_pdfs(pdf_files)
     df["PDF LPN"] = df["PACKAGEID"].apply(lambda x: x if x in lpns else "")
     df["RECEIVE MATCH"] = df["PACKAGEID"].apply(lambda x: "YES" if x in lpns else "NO")
 
-    # ----- SKU Match -----
+    # SKU Match
     sku_df = load_sku_lookup(sku_file)
-
     df["MAPPED DESCRIPTION"] = df["GRADE"].apply(map_description)
     df["MATCH KEY"] = (
         df["MAPPED DESCRIPTION"] + "|" +
@@ -106,7 +112,6 @@ def process_all(container_file, sku_file, pdf_files):
     )
 
     df["MATCH"] = df["SKU"].apply(lambda x: "YES" if str(x).strip() else "NO")
-
     return df
 
 
@@ -146,17 +151,20 @@ container_file = st.file_uploader("Upload Container List Excel", type="xlsx")
 sku_file = st.file_uploader("Upload SKU Lookup Excel", type="xlsx")
 pdf_files = st.file_uploader("Upload PDF Files", type="pdf", accept_multiple_files=True)
 
-processed_df = None
-
 if container_file and sku_file and pdf_files:
     if st.button("Run Full Process"):
-        processed_df = process_all(container_file, sku_file, pdf_files)
-        st.success("Processing completed")
-        st.dataframe(processed_df.head(50), use_container_width=True)
+        st.session_state.processed_df = process_all(
+            container_file, sku_file, pdf_files
+        )
+        st.success("Full process completed")
+        st.dataframe(
+            st.session_state.processed_df.head(50),
+            use_container_width=True
+        )
 
         st.download_button(
             "⬇️ Download SKU + Receive Match Excel",
-            to_excel_bytes(processed_df),
+            to_excel_bytes(st.session_state.processed_df),
             container_file.name.replace(".xlsx", "_SKU_RECEIVE_MATCH.xlsx")
         )
 
@@ -170,14 +178,15 @@ sa_name = st.text_input(
     value="Sales_Assist"
 )
 
-if processed_df is not None:
-    if st.button("Generate Sales Assist Excel"):
-        sa_df = generate_sales_assist(processed_df)
-        st.success("Sales Assist report generated")
-        st.download_button(
-            "⬇️ Download Sales Assist Excel",
-            to_excel_bytes(sa_df),
-            f"{sa_name}.xlsx"
-        )
-else:
-    st.info("Run the full process above before generating Sales Assist.")
+if st.session_state.processed_df is None:
+    st.info("ℹ️ Run the **Full Process** above before generating Sales Assist.")
+
+if st.session_state.processed_df is not None and st.button("Generate Sales Assist Excel"):
+    sa_df = generate_sales_assist(st.session_state.processed_df)
+    st.success("Sales Assist report generated")
+
+    st.download_button(
+        "⬇️ Download Sales Assist Excel",
+        to_excel_bytes(sa_df),
+        f"{sa_name}.xlsx"
+    )
