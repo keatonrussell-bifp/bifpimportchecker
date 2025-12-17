@@ -6,107 +6,85 @@ from io import BytesIO
 
 
 # --------------------------------------------------
-# Utility: Excel download
+# Helpers
 # --------------------------------------------------
 def to_excel_bytes(df):
-    output = BytesIO()
-    df.to_excel(output, index=False)
-    output.seek(0)
-    return output
+    bio = BytesIO()
+    df.to_excel(bio, index=False)
+    bio.seek(0)
+    return bio
+
+
+def normalize_headers(df):
+    header_row = None
+    for i in range(min(20, len(df))):
+        if "GRADE" in df.iloc[i].astype(str).str.upper().values:
+            header_row = i
+            break
+    if header_row is None:
+        raise ValueError("Could not locate header row containing GRADE")
+    df.columns = df.iloc[header_row].astype(str).str.strip().str.upper()
+    return df.iloc[header_row + 1:].reset_index(drop=True)
 
 
 # --------------------------------------------------
-# Stage 1: Receive Match Checker
+# Receive Match
 # --------------------------------------------------
 def extract_lpns_from_pdfs(pdf_files):
     lpns = set()
     pattern = re.compile(r"\b\d{8,12}\b")
-
     for pdf in pdf_files:
         reader = PdfReader(pdf)
         for page in reader.pages:
             text = page.extract_text()
-            if not text:
-                continue
-            for m in pattern.findall(text):
-                lpns.add(m)
+            if text:
+                lpns.update(pattern.findall(text))
     return lpns
 
 
 def run_receive_match(excel_file, pdf_files):
-    # Header is row 2
     df = pd.read_excel(excel_file, header=1, dtype=str).fillna("")
-    df.columns = df.columns.astype(str).str.strip().str.upper()
+    df.columns = df.columns.str.upper().str.strip()
 
     if "PACKAGEID" not in df.columns:
-        raise ValueError("PACKAGEID column not found (expected on row 2)")
+        raise ValueError("PACKAGEID column not found (row 2 expected)")
 
     lpns = extract_lpns_from_pdfs(pdf_files)
 
-    pdf_lpn = []
-    receive_match = []
-
-    for pkg in df["PACKAGEID"]:
-        pkg = str(pkg).strip()
-        if pkg in lpns:
-            pdf_lpn.append(pkg)
-            receive_match.append("YES")
-        else:
-            pdf_lpn.append("")
-            receive_match.append("NO")
-
-    df["PDF LPN"] = pdf_lpn
-    df["RECEIVE MATCH"] = receive_match
-
+    df["PDF LPN"] = df["PACKAGEID"].apply(lambda x: x if x in lpns else "")
+    df["RECEIVE MATCH"] = df["PACKAGEID"].apply(lambda x: "YES" if x in lpns else "NO")
     return df
 
 
 # --------------------------------------------------
-# Stage 2: SKU Adder
+# SKU Adder
 # --------------------------------------------------
-def map_description(grade: str) -> str:
-    grade = str(grade).upper().strip()
-
+def map_description(grade):
+    grade = str(grade).upper()
     if "APG" in grade:
         return "TAEDA PINE APG"
     if "DOG" in grade:
         return "DOG EAR"
     if re.search(r"\bIII/V\b|\bIII\b", grade):
         return "TAEDA PINE #3 COMMON"
-
-    # Default
     return "DOG EAR"
 
 
-def normalize_container_headers(df):
-    header_row = None
-    for i in range(min(20, len(df))):
-        row = df.iloc[i].astype(str).str.upper()
-        if "GRADE" in row.values:
-            header_row = i
-            break
+def run_sku_adder(container_raw_df, sku_file):
+    container_df = normalize_headers(container_raw_df).fillna("")
 
-    if header_row is None:
-        raise ValueError("Could not locate header row containing GRADE")
-
-    df.columns = df.iloc[header_row].astype(str).str.strip().str.upper()
-    return df.iloc[header_row + 1:].reset_index(drop=True)
-
-
-def run_sku_adder(container_df, sku_lookup_file):
     # Load SKU lookup
-    sku_xls = pd.ExcelFile(sku_lookup_file)
+    xls = pd.ExcelFile(sku_file)
     sku_df = None
-
-    for sheet in sku_xls.sheet_names:
-        temp = sku_xls.parse(sheet, dtype=str)
-        temp.columns = temp.columns.astype(str).str.strip().str.upper()
-        if {"SKU", "DESCRIPTION", "THICKNESS", "WIDTH", "LENGTH"}.issubset(temp.columns):
-            sku_df = temp
+    for sheet in xls.sheet_names:
+        tmp = xls.parse(sheet, dtype=str)
+        tmp.columns = tmp.columns.str.upper().str.strip()
+        if {"SKU", "DESCRIPTION", "THICKNESS", "WIDTH", "LENGTH"}.issubset(tmp.columns):
+            sku_df = tmp
             break
 
     if sku_df is None:
-        raise ValueError("SKU lookup must contain SKU, DESCRIPTION, THICKNESS, WIDTH, LENGTH")
+        raise ValueError("SKU lookup missing required columns")
 
     sku_df = sku_df.fillna("")
     sku_df["DESCRIPTION"] = sku_df["DESCRIPTION"].str.upper().str.strip()
@@ -118,119 +96,104 @@ def run_sku_adder(container_df, sku_lookup_file):
         sku_df["LENGTH"]
     )
 
-    # Normalize container headers again (works for receive-match output too)
-    raw_df = container_df.copy()
-    raw_df.columns = raw_df.columns.astype(str)
-    cont_df = normalize_container_headers(raw_df).fillna("")
-
-    cont_df["MAPPED DESCRIPTION"] = cont_df["GRADE"].apply(map_description)
-
-    cont_df["MATCH KEY"] = (
-        cont_df["MAPPED DESCRIPTION"] + "|" +
-        cont_df["THICKNESS"] + "|" +
-        cont_df["WIDTH"] + "|" +
-        cont_df["LENGTH"]
+    container_df["MAPPED DESCRIPTION"] = container_df["GRADE"].apply(map_description)
+    container_df["MATCH KEY"] = (
+        container_df["MAPPED DESCRIPTION"] + "|" +
+        container_df["THICKNESS"] + "|" +
+        container_df["WIDTH"] + "|" +
+        container_df["LENGTH"]
     )
 
-    final_df = cont_df.merge(
+    out = container_df.merge(
         sku_df[["SKU", "MATCH KEY"]],
         how="left",
         on="MATCH KEY"
     )
 
-    return final_df
+    out["MATCH"] = out["SKU"].apply(lambda x: "YES" if str(x).strip() else "NO")
+    return out
+
+
+# --------------------------------------------------
+# Sales Assist Generator
+# --------------------------------------------------
+def generate_sales_assist(df):
+    order_number = (
+        df.get("ORDERNUMBER", "")
+        .astype(str)
+        .str.split("-")
+        .str[0]
+    )
+
+    return pd.DataFrame({
+        "SKU": df.get("SKU", ""),
+        "Pieces": pd.to_numeric(df.get("PCS", 0), errors="coerce").fillna(0),
+        "Quantity": pd.to_numeric(df.get("QTY", 0), errors="coerce").fillna(0),
+        "QuantityUOM": "BF",
+        "PriceUOM": "MBF",
+        "PricePerUOM": 0,
+        "OrderNumber": pd.to_numeric(order_number, errors="coerce").fillna(0),
+        "ContainerNumber": df.get("CONTAINER", ""),
+        "ReloadReference": "",
+        "Identifier": pd.to_numeric(df.get("PACKAGEID", 0), errors="coerce").fillna(0),
+        "ProFormaPrice": 0
+    })
 
 
 # --------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------
-st.set_page_config(page_title="Receive Match + SKU Adder", layout="wide")
-st.title("📦 Receive Match Checker + SKU Adder")
+st.set_page_config(page_title="Receive Match + SKU + Sales Assist", layout="wide")
+st.title("📦 Receive Match → SKU Adder → Sales Assist")
 
-st.markdown(
-    """
-This app supports a **two-stage workflow**:
-
-1. **Receive Match Checker**  
-   Match `PACKAGEID` from Excel against LPNs in PDFs.
-
-2. **SKU Adder (Optional)**  
-   Add SKUs using the output from Receive Match Checker.
-"""
-)
-
-st.divider()
-
-# ======================
-# Stage 1 UI
-# ======================
+# ------------------ Step 1 ------------------
 st.header("Step 1️⃣ Receive Match Checker")
 
-excel_rm = st.file_uploader(
-    "Upload Container Excel (PACKAGEID on row 2)",
-    type=["xlsx"],
-    key="rm_excel"
-)
-
-pdfs_rm = st.file_uploader(
-    "Upload PDF files",
-    type=["pdf"],
-    accept_multiple_files=True,
-    key="rm_pdfs"
-)
+rm_excel = st.file_uploader("Upload Container Excel (PACKAGEID on row 2)", type="xlsx", key="rm_excel")
+rm_pdfs = st.file_uploader("Upload PDFs", type="pdf", accept_multiple_files=True, key="rm_pdfs")
 
 rm_df = None
-
-if excel_rm and pdfs_rm:
-    if st.button("Run Receive Match"):
-        try:
-            rm_df = run_receive_match(excel_rm, pdfs_rm)
-            st.success("Receive Match completed")
-            st.dataframe(rm_df.head(50), use_container_width=True)
-
-            st.download_button(
-                "⬇️ Download Receive Match Excel",
-                data=to_excel_bytes(rm_df),
-                file_name=excel_rm.name.replace(".xlsx", "_RECEIVE_MATCH.xlsx"),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        except Exception as e:
-            st.error(str(e))
+if rm_excel and rm_pdfs and st.button("Run Receive Match"):
+    rm_df = run_receive_match(rm_excel, rm_pdfs)
+    st.success("Receive Match completed")
+    st.dataframe(rm_df.head(50), use_container_width=True)
+    st.download_button(
+        "⬇️ Download Receive Match Excel",
+        to_excel_bytes(rm_df),
+        rm_excel.name.replace(".xlsx", "_RECEIVE_MATCH.xlsx")
+    )
 
 st.divider()
 
-# ======================
-# Stage 2 UI
-# ======================
-st.header("Step 2️⃣ SKU Adder (Optional)")
+# ------------------ Step 2 ------------------
+st.header("Step 2️⃣ SKU Adder")
 
-sku_lookup = st.file_uploader(
-    "Upload SKU Lookup Excel",
-    type=["xlsx"],
-    key="sku_lookup"
-)
+sku_lookup = st.file_uploader("Upload SKU Lookup Excel", type="xlsx", key="sku_lookup")
+sku_input = st.file_uploader("Upload Receive Match Excel (or original)", type="xlsx", key="sku_input")
 
-sku_input_excel = st.file_uploader(
-    "Upload Receive Match Excel (or original container list)",
-    type=["xlsx"],
-    key="sku_input"
-)
+sku_df = None
+if sku_lookup and sku_input and st.button("Run SKU Adder"):
+    raw_df = pd.read_excel(sku_input, header=None, dtype=str)
+    sku_df = run_sku_adder(raw_df, sku_lookup)
+    st.success("SKU Adder completed")
+    st.dataframe(sku_df.head(50), use_container_width=True)
+    st.download_button(
+        "⬇️ Download SKU Added Excel",
+        to_excel_bytes(sku_df),
+        sku_input.name.replace(".xlsx", "_SKU_ADDED.xlsx")
+    )
 
-if sku_lookup and sku_input_excel:
-    if st.button("Run SKU Adder"):
-        try:
-            # Read the uploaded SKU input as raw DataFrame
-            raw_df = pd.read_excel(sku_input_excel, header=None, dtype=str)
-            final_sku_df = run_sku_adder(raw_df, sku_lookup)
+st.divider()
 
-            st.success("SKU Adder completed")
-            st.dataframe(final_sku_df.head(50), use_container_width=True)
+# ------------------ Step 3 ------------------
+st.header("Step 3️⃣ Sales Assist Report")
 
-            st.download_button(
-                "⬇️ Download SKU Added Excel",
-                data=to_excel_bytes(final_sku_df),
-                file_name=sku_input_excel.name.replace(".xlsx", "_SKU_ADDED.xlsx"),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        except Exception as e:
-            st.error(str(e))
+if sku_df is not None and st.button("Generate Sales Assist Excel"):
+    sa_df = generate_sales_assist(sku_df)
+    st.success("Sales Assist report generated")
+    st.dataframe(sa_df.head(50), use_container_width=True)
+    st.download_button(
+        "⬇️ Download Sales Assist Excel",
+        to_excel_bytes(sa_df),
+        "Sales_Assist.xlsx"
+    )
