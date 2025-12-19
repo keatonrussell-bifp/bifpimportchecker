@@ -60,7 +60,7 @@ def map_description(grade):
         return "TAEDA PINE APG"
     if "DOG" in grade:
         return "DOG EAR"
-    if re.search(r"\bIII/V\b|\bIII\b", grade):
+    if re.search(r"\bIII/V\b|\bIII\b|\b3COM\b", grade):
         return "TAEDA PINE #3 COMMON"
     return "DOG EAR"
 
@@ -190,3 +190,4 @@ if st.session_state.processed_df is not None and st.button("Generate Sales Assis
         to_excel_bytes(sa_df),
         f"{sa_name}.xlsx"
     )
+
