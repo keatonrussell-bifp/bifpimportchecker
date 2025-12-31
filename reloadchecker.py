@@ -76,55 +76,75 @@ def norm_int_str(x):
 
 
 # --------------------------------------------------
-# LPN / PDF Logic (KEEP YOUR WORKING LPN EXTRACTOR)
+# PDF Logic (ONE PASS: LPN + PIECES)
 # --------------------------------------------------
-def extract_lpns_from_pdfs(pdf_files):
-    lpns = set()
-    pattern = re.compile(r"\b\d{8,12}\b")
+def extract_lpns_and_pieces_from_pdfs(pdf_files):
+    """
+    Returns:
+      lpns_set: set of LPNs found (8-12 digits)
+      pieces_map: dict {LPN: PIECES}
+
+    Key detail: Many of your PDFs extract rows like:
+        ITEM ... PIECES  LPN  TOTAL_LBS
+      Example line (real from your PDF extraction):
+        '3COM 1X4X96 240 7052583281 1120.0000'
+      So we match PIECES by looking adjacent to the LPN token (before OR after).
+    """
+    lpns_set = set()
+    pieces_map = {}
+
+    # EXACTLY like your working version: grab all 8-12 digit numbers
+    lpn_findall = re.compile(r"\b\d{8,12}\b")
+
+    # Token-level patterns
+    lpn_token = re.compile(r"^\d{8,12}$")
+    int_token = re.compile(r"^\d+$")
+
+    def is_reasonable_pieces(tok: str) -> bool:
+        if not int_token.match(tok):
+            return False
+        v = int(tok)
+        return 1 <= v <= 5000
 
     for pdf in pdf_files:
-        # Use BytesIO(pdf.getvalue()) so we never get file-pointer issues
+        # IMPORTANT: Use getvalue() so we don't hit file-pointer / EOF issues
         reader = PdfReader(BytesIO(pdf.getvalue()))
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                lpns.update(pattern.findall(text))
-    return lpns
 
-
-# --------------------------------------------------
-# PCS / PIECES from PDF Logic (NEW, BASED ON YOUR EXTRACTED TEXT)
-# --------------------------------------------------
-def extract_pcs_map_from_pdfs(pdf_files):
-    """
-    Extract PCS/PIECES by matching the pattern you pasted:
-      LPN  PIECES  TOTAL_LBS
-    Example:
-      7052583281 240 1120.0000
-
-    Returns dict: {LPN: PIECES}
-    """
-    pcs_map = {}
-
-    # LPN (8–12 digits) + PIECES (1–5 digits) + TOTAL LBS (decimal)
-    row_pattern = re.compile(r"\b(\d{8,12})\b\s+(\d{1,5})\b\s+\d+(?:\.\d+)?")
-
-    for pdf in pdf_files:
-        reader = PdfReader(BytesIO(pdf.getvalue()))
         for page in reader.pages:
             text = page.extract_text()
             if not text:
                 continue
 
-            # Collapse whitespace so row regex works even if the PDF breaks lines oddly
-            flat = re.sub(r"\s+", " ", text)
+            # LPNs (keep your proven behavior)
+            lpns_set.update(lpn_findall.findall(text))
 
-            for lpn, pieces in row_pattern.findall(flat):
-                # keep first seen; if repeats exist they should be same
-                if lpn not in pcs_map:
-                    pcs_map[lpn] = pieces
+            # PIECES mapping (line-based, adjacent to LPN)
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
 
-    return pcs_map
+                tokens = line.split()
+                # Look for any LPN token in this line
+                for idx, tok in enumerate(tokens):
+                    if not lpn_token.match(tok):
+                        continue
+
+                    lpn = tok
+
+                    # Search nearby tokens for a reasonable PIECES value
+                    pieces_val = None
+                    # Check closest first (before/after), then widen
+                    for off in (-1, 1, -2, 2, -3, 3):
+                        j = idx + off
+                        if 0 <= j < len(tokens) and is_reasonable_pieces(tokens[j]):
+                            pieces_val = tokens[j]
+                            break
+
+                    if pieces_val and lpn not in pieces_map:
+                        pieces_map[lpn] = pieces_val
+
+    return lpns_set, pieces_map
 
 
 # --------------------------------------------------
@@ -141,14 +161,24 @@ def map_description(grade):
     return "DOG EAR"
 
 
+def sku_is_valid(val):
+    if pd.isna(val):
+        return False
+    val = str(val).strip().upper()
+    return val not in ("", "NAN", "NONE")
+
+
 def load_sku_lookup(sku_file):
-    # Slightly more tolerant than strict, but still safe
+    """
+    Tolerant column detection (won't break if your SKU sheet uses DESC/THK/LEN/W etc.)
+    Normalizes to: SKU, DESCRIPTION, THICKNESS, WIDTH, LENGTH
+    """
     REQUIRED = {
         "SKU": ["SKU"],
         "DESCRIPTION": ["DESCRIPTION", "DESC", "PRODUCT DESCRIPTION", "GRADE DESC"],
-        "THICKNESS": ["THICKNESS", "THK"],
+        "THICKNESS": ["THICKNESS", "THK", "THICK"],
         "WIDTH": ["WIDTH", "W"],
-        "LENGTH": ["LENGTH", "LEN", "L"]
+        "LENGTH": ["LENGTH", "LEN", "L"],
     }
 
     xls = pd.ExcelFile(sku_file)
@@ -167,21 +197,14 @@ def load_sku_lookup(sku_file):
             df = df.rename(columns=col_map).fillna("")
             df["DESCRIPTION"] = df["DESCRIPTION"].str.upper().str.strip()
             df["MATCH KEY"] = (
-                df["DESCRIPTION"] + "|" +
-                df["THICKNESS"] + "|" +
-                df["WIDTH"] + "|" +
-                df["LENGTH"]
+                df["DESCRIPTION"] + "|"
+                + df["THICKNESS"] + "|"
+                + df["WIDTH"] + "|"
+                + df["LENGTH"]
             )
             return df
 
     raise ValueError("SKU lookup missing required columns (SKU/DESCRIPTION/THICKNESS/WIDTH/LENGTH).")
-
-
-def sku_is_valid(val):
-    if pd.isna(val):
-        return False
-    val = str(val).strip().upper()
-    return val not in ("", "NAN", "NONE")
 
 
 # --------------------------------------------------
@@ -191,24 +214,23 @@ def process_all(container_file, sku_file, pdf_files):
     raw_df = pd.read_excel(container_file, header=None, dtype=str)
     df = normalize_headers(raw_df).fillna("")
 
-    # Validate required columns in container list
+    # Required fields for this workflow
     required_cols = {"PACKAGEID", "PCS", "GRADE", "THICKNESS", "WIDTH", "LENGTH"}
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Container list missing required columns: {missing}")
 
-    # Normalize keys
+    # Normalize keys so comparisons are reliable
     df["PACKAGEID"] = df["PACKAGEID"].apply(norm_id)
     df["PCS"] = df["PCS"].apply(norm_int_str)
 
-    # --- Receive Match (LPN)
-    lpns = extract_lpns_from_pdfs(pdf_files)
+    # --- Receive + Pieces (PDF)
+    lpns, pieces_map = extract_lpns_and_pieces_from_pdfs(pdf_files)
+
     df["PDF LPN"] = df["PACKAGEID"].apply(lambda x: x if x in lpns else "")
     df["RECEIVE MATCH"] = df["PACKAGEID"].apply(lambda x: "YES" if x in lpns else "NO")
 
-    # --- PCS Check
-    pcs_map = extract_pcs_map_from_pdfs(pdf_files)
-    df["PCS CHECK"] = df["PACKAGEID"].apply(lambda x: pcs_map.get(x, ""))
+    df["PCS CHECK"] = df["PACKAGEID"].apply(lambda x: pieces_map.get(x, ""))
 
     def pcs_match(container_pcs, pdf_pcs):
         try:
@@ -223,12 +245,13 @@ def process_all(container_file, sku_file, pdf_files):
 
     # --- SKU Match
     sku_df = load_sku_lookup(sku_file)
+
     df["MAPPED DESCRIPTION"] = df["GRADE"].apply(map_description)
     df["MATCH KEY"] = (
-        df["MAPPED DESCRIPTION"] + "|" +
-        df["THICKNESS"] + "|" +
-        df["WIDTH"] + "|" +
-        df["LENGTH"]
+        df["MAPPED DESCRIPTION"] + "|"
+        + df["THICKNESS"] + "|"
+        + df["WIDTH"] + "|"
+        + df["LENGTH"]
     )
 
     df = df.merge(
@@ -239,11 +262,14 @@ def process_all(container_file, sku_file, pdf_files):
 
     df["MATCH"] = df["SKU"].apply(lambda x: "YES" if sku_is_valid(x) else "NO")
 
-    # --- Audit-friendly ordering (put audit columns at the end)
+    # --- Optional column ordering (audit-friendly)
     audit_cols = ["PDF LPN", "RECEIVE MATCH", "PCS CHECK", "PCS MATCH", "SKU", "MATCH"]
     existing_audit = [c for c in audit_cols if c in df.columns]
     others = [c for c in df.columns if c not in existing_audit]
     df = df[others + existing_audit]
+
+    # ensure blanks are blank (not NaN)
+    df = df.fillna("")
 
     return df
 
@@ -275,10 +301,9 @@ def generate_sales_assist(df):
 
 
 # --------------------------------------------------
-# UI Styling: Red rows if any mismatch
+# UI Styling: red rows if any mismatch
 # --------------------------------------------------
 def highlight_mismatches(row):
-    # Any NO triggers red row
     if (
         row.get("RECEIVE MATCH") != "YES"
         or row.get("PCS MATCH") != "YES"
@@ -294,26 +319,48 @@ def highlight_mismatches(row):
 st.set_page_config(page_title="SKU + Receive + PCS Match + Sales Assist", layout="wide")
 st.title("📦 SKU + Receive + PCS Match + Sales Assist Generator")
 
+show_debug = st.checkbox("Show debug info", value=False)
+
 container_file = st.file_uploader("Upload Container List Excel", type="xlsx")
 sku_file = st.file_uploader("Upload SKU Lookup Excel", type="xlsx")
 pdf_files = st.file_uploader("Upload PDF Files", type="pdf", accept_multiple_files=True)
 
 if container_file and sku_file and pdf_files:
     if st.button("Run Full Process"):
-        st.session_state.processed_df = process_all(
-            container_file, sku_file, pdf_files
-        )
-        st.success("Full process completed")
+        try:
+            st.session_state.processed_df = process_all(
+                container_file, sku_file, pdf_files
+            )
+            st.success("Full process completed")
 
-        # Styled view (red mismatches)
-        styled = st.session_state.processed_df.style.apply(highlight_mismatches, axis=1)
-        st.dataframe(styled, use_container_width=True)
+            dfp = st.session_state.processed_df
 
-        st.download_button(
-            "⬇️ Download SKU + Receive + PCS Match Excel",
-            to_excel_bytes(st.session_state.processed_df),
-            container_file.name.replace(".xlsx", "_SKU_RECEIVE_PCS_MATCH.xlsx")
-        )
+            if show_debug:
+                # quick counters
+                st.write({
+                    "Rows": len(dfp),
+                    "Receive YES": int((dfp["RECEIVE MATCH"] == "YES").sum()),
+                    "PCS MATCH YES": int((dfp["PCS MATCH"] == "YES").sum()),
+                    "SKU MATCH YES": int((dfp["MATCH"] == "YES").sum()),
+                    "PCS CHECK populated": int((dfp["PCS CHECK"].astype(str).str.strip() != "").sum()),
+                })
+
+            styled = dfp.style.apply(highlight_mismatches, axis=1)
+
+            # Streamlit versions differ; try dataframe first, fallback to write
+            try:
+                st.dataframe(styled, use_container_width=True)
+            except Exception:
+                st.write(styled)
+
+            st.download_button(
+                "⬇️ Download SKU + Receive + PCS Match Excel",
+                to_excel_bytes(dfp),
+                container_file.name.replace(".xlsx", "_SKU_RECEIVE_PCS_MATCH.xlsx")
+            )
+
+        except Exception as e:
+            st.error(str(e))
 
 st.divider()
 
