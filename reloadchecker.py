@@ -111,7 +111,14 @@ def process_all(container_file, sku_file, pdf_files):
         on="MATCH KEY"
     )
 
-    df["MATCH"] = df["SKU"].apply(lambda x: "YES" if str(x).strip() else "NO")
+    def sku_is_valid(val):
+        if pd.isna(val):
+            return False
+        val = str(val).strip().upper()
+        return val not in ("", "NAN", "NONE")
+
+    df["MATCH"] = df["SKU"].apply(lambda x: "YES" if sku_is_valid(x) else "NO")
+
     return df
 
 
@@ -190,4 +197,5 @@ if st.session_state.processed_df is not None and st.button("Generate Sales Assis
         to_excel_bytes(sa_df),
         f"{sa_name}.xlsx"
     )
+
 
