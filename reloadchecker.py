@@ -6,7 +6,7 @@ from io import BytesIO
 
 
 # --------------------------------------------------
-# Session State Init
+# Session State
 # --------------------------------------------------
 if "processed_df" not in st.session_state:
     st.session_state.processed_df = None
@@ -36,19 +36,39 @@ def normalize_headers(df):
 
 
 # --------------------------------------------------
-# LPN / PDF Logic
+# PDF Extraction
 # --------------------------------------------------
-def extract_lpns_from_pdfs(pdf_files):
+def extract_lpn_and_pcs_from_pdfs(pdf_files):
+    """
+    Returns:
+      lpns_set -> set of PACKAGEIDs found
+      pcs_map  -> {PACKAGEID: PCS}
+    """
     lpns = set()
-    pattern = re.compile(r"\b\d{8,12}\b")
+    pcs_map = {}
+
+    lpn_pattern = re.compile(r"\b\d{8,12}\b")
+    pcs_pattern = re.compile(r"\bPCS[:\s]*([0-9]+)\b", re.IGNORECASE)
 
     for pdf in pdf_files:
         reader = PdfReader(pdf)
         for page in reader.pages:
             text = page.extract_text()
-            if text:
-                lpns.update(pattern.findall(text))
-    return lpns
+            if not text:
+                continue
+
+            found_lpns = lpn_pattern.findall(text)
+            pcs_match = pcs_pattern.search(text)
+
+            if found_lpns:
+                lpns.update(found_lpns)
+
+                if pcs_match:
+                    pcs_val = pcs_match.group(1)
+                    for lpn in found_lpns:
+                        pcs_map[lpn] = pcs_val
+
+    return lpns, pcs_map
 
 
 # --------------------------------------------------
@@ -83,20 +103,49 @@ def load_sku_lookup(sku_file):
     raise ValueError("SKU lookup missing required columns")
 
 
+def sku_is_valid(val):
+    if pd.isna(val):
+        return False
+    val = str(val).strip().upper()
+    return val not in ("", "NAN", "NONE")
+
+
 # --------------------------------------------------
-# Combined Processor
+# Main Processor
 # --------------------------------------------------
 def process_all(container_file, sku_file, pdf_files):
+
     raw_df = pd.read_excel(container_file, header=None, dtype=str)
     df = normalize_headers(raw_df).fillna("")
 
-    # Receive Match
-    lpns = extract_lpns_from_pdfs(pdf_files)
-    df["PDF LPN"] = df["PACKAGEID"].apply(lambda x: x if x in lpns else "")
-    df["RECEIVE MATCH"] = df["PACKAGEID"].apply(lambda x: "YES" if x in lpns else "NO")
+    # -------- PDF READ --------
+    lpns_set, pcs_map = extract_lpn_and_pcs_from_pdfs(pdf_files)
 
-    # SKU Match
+    # -------- RECEIVE CHECK --------
+    df["PDF LPN"] = df["PACKAGEID"].apply(lambda x: x if str(x) in lpns_set else "")
+    df["RECEIVE MATCH"] = df["PACKAGEID"].apply(
+        lambda x: "YES" if str(x) in lpns_set else "NO"
+    )
+
+    # -------- PCS CHECK --------
+    df["PDF PCS"] = df["PACKAGEID"].apply(
+        lambda x: pcs_map.get(str(x), "")
+    )
+
+    def pcs_match(container_pcs, pdf_pcs):
+        try:
+            return "YES" if int(container_pcs) == int(pdf_pcs) else "NO"
+        except:
+            return "NO"
+
+    df["PCS MATCH"] = df.apply(
+        lambda r: pcs_match(r.get("PCS", ""), r.get("PDF PCS", "")),
+        axis=1
+    )
+
+    # -------- SKU MATCH --------
     sku_df = load_sku_lookup(sku_file)
+
     df["MAPPED DESCRIPTION"] = df["GRADE"].apply(map_description)
     df["MATCH KEY"] = (
         df["MAPPED DESCRIPTION"] + "|" +
@@ -111,13 +160,14 @@ def process_all(container_file, sku_file, pdf_files):
         on="MATCH KEY"
     )
 
-    def sku_is_valid(val):
-        if pd.isna(val):
-            return False
-        val = str(val).strip().upper()
-        return val not in ("", "NAN", "NONE")
+    df["MATCH"] = df["SKU"].apply(
+        lambda x: "YES" if sku_is_valid(x) else "NO"
+    )
 
-    df["MATCH"] = df["SKU"].apply(lambda x: "YES" if sku_is_valid(x) else "NO")
+    # Optional cleanup: blank invalid SKUs
+    df["SKU"] = df["SKU"].apply(
+        lambda x: str(x).strip() if sku_is_valid(x) else ""
+    )
 
     return df
 
@@ -151,8 +201,8 @@ def generate_sales_assist(df):
 # --------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------
-st.set_page_config(page_title="SKU + Receive Match + Sales Assist", layout="wide")
-st.title("📦 SKU + Receive Match + Sales Assist Generator")
+st.set_page_config(page_title="SKU + Receive + PCS Checker", layout="wide")
+st.title("📦 SKU + Receive + PCS Validation Tool")
 
 container_file = st.file_uploader("Upload Container List Excel", type="xlsx")
 sku_file = st.file_uploader("Upload SKU Lookup Excel", type="xlsx")
@@ -163,16 +213,16 @@ if container_file and sku_file and pdf_files:
         st.session_state.processed_df = process_all(
             container_file, sku_file, pdf_files
         )
-        st.success("Full process completed")
+        st.success("Processing completed")
         st.dataframe(
             st.session_state.processed_df.head(50),
             use_container_width=True
         )
 
         st.download_button(
-            "⬇️ Download SKU + Receive Match Excel",
+            "⬇️ Download SKU + Receive + PCS Check Excel",
             to_excel_bytes(st.session_state.processed_df),
-            container_file.name.replace(".xlsx", "_SKU_RECEIVE_MATCH.xlsx")
+            container_file.name.replace(".xlsx", "_AUDIT_CHECK.xlsx")
         )
 
 st.divider()
@@ -186,7 +236,7 @@ sa_name = st.text_input(
 )
 
 if st.session_state.processed_df is None:
-    st.info("ℹ️ Run the **Full Process** above before generating Sales Assist.")
+    st.info("ℹ️ Run the full process before generating Sales Assist.")
 
 if st.session_state.processed_df is not None and st.button("Generate Sales Assist Excel"):
     sa_df = generate_sales_assist(st.session_state.processed_df)
@@ -197,5 +247,3 @@ if st.session_state.processed_df is not None and st.button("Generate Sales Assis
         to_excel_bytes(sa_df),
         f"{sa_name}.xlsx"
     )
-
-
