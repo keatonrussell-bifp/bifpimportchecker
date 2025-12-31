@@ -36,39 +36,52 @@ def normalize_headers(df):
 
 
 # --------------------------------------------------
-# PDF Extraction (LPN + PCS / PIECES)
+# PDF Extraction (TABLE-AWARE)
 # --------------------------------------------------
 def extract_lpn_and_pcs_from_pdfs(pdf_files):
-    lpns = set()
+    """
+    Parses table-style PDFs like:
+    ITEM | LOT | SUBLOT | LPN | PIECES | TOTAL LBS
+    """
+
+    lpns_set = set()
     pcs_map = {}
 
-    lpn_pattern = re.compile(r"\b\d{8,12}\b")
-
-    # 🔑 FIX: supports PCS and PIECES
-    pcs_pattern = re.compile(
-        r"\b(?:PCS|PIECES)\s*[:=\-]?\s*([0-9]+)\b",
-        re.IGNORECASE
-    )
+    lpn_pattern = re.compile(r"^\d{8,12}$")
 
     for pdf in pdf_files:
         reader = PdfReader(pdf)
+
         for page in reader.pages:
             text = page.extract_text()
             if not text:
                 continue
 
-            found_lpns = lpn_pattern.findall(text)
-            pcs_match = pcs_pattern.search(text)
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
 
-            if found_lpns:
-                lpns.update(found_lpns)
+            for line in lines:
+                # Split PDF table rows on multiple spaces or tabs
+                parts = re.split(r"\s{2,}|\t", line)
 
-                if pcs_match:
-                    pcs_val = pcs_match.group(1)
-                    for lpn in found_lpns:
-                        pcs_map[lpn] = pcs_val
+                # Find LPN cell
+                lpn_candidates = [p for p in parts if lpn_pattern.match(p)]
+                if not lpn_candidates:
+                    continue
 
-    return lpns, pcs_map
+                lpn = lpn_candidates[0]
+
+                try:
+                    lpn_index = parts.index(lpn)
+                    pieces_candidate = parts[lpn_index + 1]
+
+                    if pieces_candidate.isdigit():
+                        lpns_set.add(lpn)
+                        pcs_map[lpn] = pieces_candidate
+
+                except Exception:
+                    continue
+
+    return lpns_set, pcs_map
 
 
 # --------------------------------------------------
@@ -93,12 +106,6 @@ def sku_is_valid(val):
 
 
 def load_sku_lookup(sku_file):
-    """
-    Loads SKU lookup with tolerant header matching.
-    Normalizes to:
-    SKU, DESCRIPTION, THICKNESS, WIDTH, LENGTH
-    """
-
     REQUIRED = {
         "SKU": ["SKU"],
         "DESCRIPTION": ["DESCRIPTION", "DESC", "GRADE DESC", "PRODUCT DESCRIPTION"],
@@ -114,7 +121,6 @@ def load_sku_lookup(sku_file):
         df.columns = df.columns.str.upper().str.strip()
 
         column_map = {}
-
         for canonical, aliases in REQUIRED.items():
             for alias in aliases:
                 if alias in df.columns:
@@ -122,9 +128,7 @@ def load_sku_lookup(sku_file):
                     break
 
         if set(column_map.values()) == set(REQUIRED.keys()):
-            df = df.rename(columns=column_map)
-            df = df.fillna("")
-
+            df = df.rename(columns=column_map).fillna("")
             df["DESCRIPTION"] = df["DESCRIPTION"].str.upper().str.strip()
 
             df["MATCH KEY"] = (
@@ -133,18 +137,9 @@ def load_sku_lookup(sku_file):
                 df["WIDTH"] + "|" +
                 df["LENGTH"]
             )
-
             return df
 
-    raise ValueError(
-        "SKU lookup missing required columns.\n"
-        "Expected one of each:\n"
-        "- SKU\n"
-        "- DESCRIPTION (or DESC)\n"
-        "- THICKNESS (or THK)\n"
-        "- WIDTH (or W)\n"
-        "- LENGTH (or LEN)"
-    )
+    raise ValueError("SKU lookup missing required columns")
 
 
 # --------------------------------------------------
@@ -158,7 +153,7 @@ def process_all(container_file, sku_file, pdf_files):
     # -------- PDF READ --------
     lpns_set, pcs_map = extract_lpn_and_pcs_from_pdfs(pdf_files)
 
-    # -------- RECEIVE CHECK --------
+    # -------- RECEIVE MATCH --------
     df["PDF LPN"] = df["PACKAGEID"].apply(lambda x: x if str(x) in lpns_set else "")
     df["RECEIVE MATCH"] = df["PACKAGEID"].apply(
         lambda x: "YES" if str(x) in lpns_set else "NO"
@@ -197,15 +192,10 @@ def process_all(container_file, sku_file, pdf_files):
         on="MATCH KEY"
     )
 
-    df["MATCH"] = df["SKU"].apply(
-        lambda x: "YES" if sku_is_valid(x) else "NO"
-    )
+    df["MATCH"] = df["SKU"].apply(lambda x: "YES" if sku_is_valid(x) else "NO")
+    df["SKU"] = df["SKU"].apply(lambda x: str(x).strip() if sku_is_valid(x) else "")
 
-    df["SKU"] = df["SKU"].apply(
-        lambda x: str(x).strip() if sku_is_valid(x) else ""
-    )
-
-    # -------- COLUMN ORDER (AUDIT FRIENDLY) --------
+    # -------- COLUMN ORDER --------
     audit_cols = [
         "PDF LPN",
         "RECEIVE MATCH",
@@ -223,7 +213,7 @@ def process_all(container_file, sku_file, pdf_files):
 
 
 # --------------------------------------------------
-# UI Styling (RED ROWS IF ANY MISMATCH)
+# UI Styling
 # --------------------------------------------------
 def highlight_mismatches(row):
     if (
@@ -255,11 +245,10 @@ if container_file and sku_file and pdf_files:
         styled_df = st.session_state.processed_df.style.apply(
             highlight_mismatches, axis=1
         )
-
         st.dataframe(styled_df, use_container_width=True)
 
         st.download_button(
-            "⬇️ Download SKU + Receive + PCS Audit Excel",
+            "⬇️ Download Audit Excel",
             to_excel_bytes(st.session_state.processed_df),
             container_file.name.replace(".xlsx", "_AUDIT_CHECK.xlsx")
         )
@@ -275,7 +264,7 @@ sa_name = st.text_input(
 )
 
 if st.session_state.processed_df is None:
-    st.info("ℹ️ Run the full process before generating Sales Assist.")
+    st.info("Run the full process before generating Sales Assist.")
 
 if st.session_state.processed_df is not None and st.button("Generate Sales Assist Excel"):
     sa_df = pd.DataFrame({
