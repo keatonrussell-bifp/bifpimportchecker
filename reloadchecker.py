@@ -36,14 +36,19 @@ def normalize_headers(df):
 
 
 # --------------------------------------------------
-# PDF Extraction
+# PDF Extraction (LPN + PCS / PIECES)
 # --------------------------------------------------
 def extract_lpn_and_pcs_from_pdfs(pdf_files):
     lpns = set()
     pcs_map = {}
 
     lpn_pattern = re.compile(r"\b\d{8,12}\b")
-    pcs_pattern = re.compile(r"\bPCS[:\s]*([0-9]+)\b", re.IGNORECASE)
+
+    # 🔑 FIX: supports PCS and PIECES
+    pcs_pattern = re.compile(
+        r"\b(?:PCS|PIECES)\s*[:=\-]?\s*([0-9]+)\b",
+        re.IGNORECASE
+    )
 
     for pdf in pdf_files:
         reader = PdfReader(pdf)
@@ -57,6 +62,7 @@ def extract_lpn_and_pcs_from_pdfs(pdf_files):
 
             if found_lpns:
                 lpns.update(found_lpns)
+
                 if pcs_match:
                     pcs_val = pcs_match.group(1)
                     for lpn in found_lpns:
@@ -217,7 +223,7 @@ def process_all(container_file, sku_file, pdf_files):
 
 
 # --------------------------------------------------
-# UI Styling
+# UI Styling (RED ROWS IF ANY MISMATCH)
 # --------------------------------------------------
 def highlight_mismatches(row):
     if (
