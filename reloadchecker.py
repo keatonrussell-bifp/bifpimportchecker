@@ -39,11 +39,6 @@ def normalize_headers(df):
 # PDF Extraction
 # --------------------------------------------------
 def extract_lpn_and_pcs_from_pdfs(pdf_files):
-    """
-    Returns:
-      lpns_set -> set of PACKAGEIDs found
-      pcs_map  -> {PACKAGEID: PCS}
-    """
     lpns = set()
     pcs_map = {}
 
@@ -62,7 +57,6 @@ def extract_lpn_and_pcs_from_pdfs(pdf_files):
 
             if found_lpns:
                 lpns.update(found_lpns)
-
                 if pcs_match:
                     pcs_val = pcs_match.group(1)
                     for lpn in found_lpns:
@@ -128,7 +122,7 @@ def process_all(container_file, sku_file, pdf_files):
     )
 
     # -------- PCS CHECK --------
-    df["PDF PCS"] = df["PACKAGEID"].apply(
+    df["PCS CHECK"] = df["PACKAGEID"].apply(
         lambda x: pcs_map.get(str(x), "")
     )
 
@@ -139,7 +133,7 @@ def process_all(container_file, sku_file, pdf_files):
             return "NO"
 
     df["PCS MATCH"] = df.apply(
-        lambda r: pcs_match(r.get("PCS", ""), r.get("PDF PCS", "")),
+        lambda r: pcs_match(r.get("PCS", ""), r.get("PCS CHECK", "")),
         axis=1
     )
 
@@ -164,45 +158,45 @@ def process_all(container_file, sku_file, pdf_files):
         lambda x: "YES" if sku_is_valid(x) else "NO"
     )
 
-    # Optional cleanup: blank invalid SKUs
     df["SKU"] = df["SKU"].apply(
         lambda x: str(x).strip() if sku_is_valid(x) else ""
     )
+
+    # -------- COLUMN ORDER (AUDIT FRIENDLY) --------
+    audit_cols = [
+        "PDF LPN",
+        "RECEIVE MATCH",
+        "PCS CHECK",
+        "PCS MATCH",
+        "SKU",
+        "MATCH"
+    ]
+
+    existing = [c for c in audit_cols if c in df.columns]
+    others = [c for c in df.columns if c not in existing]
+    df = df[others + existing]
 
     return df
 
 
 # --------------------------------------------------
-# Sales Assist Generator
+# UI Styling (RED ROWS ON ANY MISMATCH)
 # --------------------------------------------------
-def generate_sales_assist(df):
-    order_number = (
-        df.get("ORDERNUMBER", "")
-        .astype(str)
-        .str.split("-")
-        .str[0]
-    )
-
-    return pd.DataFrame({
-        "SKU": df.get("SKU", ""),
-        "Pieces": pd.to_numeric(df.get("PCS", 0), errors="coerce").fillna(0),
-        "Quantity": pd.to_numeric(df.get("QTY", 0), errors="coerce").fillna(0),
-        "QuantityUOM": "BF",
-        "PriceUOM": "MBF",
-        "PricePerUOM": 0,
-        "OrderNumber": pd.to_numeric(order_number, errors="coerce").fillna(0),
-        "ContainerNumber": df.get("CONTAINER", ""),
-        "ReloadReference": "",
-        "Identifier": pd.to_numeric(df.get("PACKAGEID", 0), errors="coerce").fillna(0),
-        "ProFormaPrice": 0
-    })
+def highlight_mismatches(row):
+    if (
+        row.get("RECEIVE MATCH") != "YES"
+        or row.get("PCS MATCH") != "YES"
+        or row.get("MATCH") != "YES"
+    ):
+        return ["background-color: #ffcccc"] * len(row)
+    return [""] * len(row)
 
 
 # --------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------
-st.set_page_config(page_title="SKU + Receive + PCS Checker", layout="wide")
-st.title("📦 SKU + Receive + PCS Validation Tool")
+st.set_page_config(page_title="SKU + Receive + PCS Audit", layout="wide")
+st.title("📦 SKU + Receive + PCS Audit Tool")
 
 container_file = st.file_uploader("Upload Container List Excel", type="xlsx")
 sku_file = st.file_uploader("Upload SKU Lookup Excel", type="xlsx")
@@ -214,13 +208,15 @@ if container_file and sku_file and pdf_files:
             container_file, sku_file, pdf_files
         )
         st.success("Processing completed")
-        st.dataframe(
-            st.session_state.processed_df.head(50),
-            use_container_width=True
+
+        styled_df = st.session_state.processed_df.style.apply(
+            highlight_mismatches, axis=1
         )
 
+        st.dataframe(styled_df, use_container_width=True)
+
         st.download_button(
-            "⬇️ Download SKU + Receive + PCS Check Excel",
+            "⬇️ Download SKU + Receive + PCS Audit Excel",
             to_excel_bytes(st.session_state.processed_df),
             container_file.name.replace(".xlsx", "_AUDIT_CHECK.xlsx")
         )
@@ -239,7 +235,26 @@ if st.session_state.processed_df is None:
     st.info("ℹ️ Run the full process before generating Sales Assist.")
 
 if st.session_state.processed_df is not None and st.button("Generate Sales Assist Excel"):
-    sa_df = generate_sales_assist(st.session_state.processed_df)
+    sa_df = pd.DataFrame({
+        "SKU": st.session_state.processed_df.get("SKU", ""),
+        "Pieces": pd.to_numeric(st.session_state.processed_df.get("PCS", 0), errors="coerce").fillna(0),
+        "Quantity": pd.to_numeric(st.session_state.processed_df.get("QTY", 0), errors="coerce").fillna(0),
+        "QuantityUOM": "BF",
+        "PriceUOM": "MBF",
+        "PricePerUOM": 0,
+        "OrderNumber": pd.to_numeric(
+            st.session_state.processed_df.get("ORDERNUMBER", "").astype(str).str.split("-").str[0],
+            errors="coerce"
+        ).fillna(0),
+        "ContainerNumber": st.session_state.processed_df.get("CONTAINER", ""),
+        "ReloadReference": "",
+        "Identifier": pd.to_numeric(
+            st.session_state.processed_df.get("PACKAGEID", 0),
+            errors="coerce"
+        ).fillna(0),
+        "ProFormaPrice": 0
+    })
+
     st.success("Sales Assist report generated")
 
     st.download_button(
