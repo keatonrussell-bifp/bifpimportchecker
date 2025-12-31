@@ -5,16 +5,16 @@ from PyPDF2 import PdfReader
 from io import BytesIO
 
 
-# --------------------------------------------------
+# ==================================================
 # Session State
-# --------------------------------------------------
+# ==================================================
 if "processed_df" not in st.session_state:
     st.session_state.processed_df = None
 
 
-# --------------------------------------------------
+# ==================================================
 # Helpers
-# --------------------------------------------------
+# ==================================================
 def to_excel_bytes(df):
     bio = BytesIO()
     df.to_excel(bio, index=False)
@@ -35,19 +35,17 @@ def normalize_headers(df):
     return df.iloc[header_row + 1:].reset_index(drop=True)
 
 
-# --------------------------------------------------
-# PDF Extraction (TABLE-AWARE)
-# --------------------------------------------------
+# ==================================================
+# PDF EXTRACTION (NUMERIC PROXIMITY – FINAL)
+# ==================================================
 def extract_lpn_and_pcs_from_pdfs(pdf_files):
     """
-    Parses table-style PDFs like:
-    ITEM | LOT | SUBLOT | LPN | PIECES | TOTAL LBS
+    PRODUCTION-GRADE parser.
+    Does NOT rely on table layout, spacing, or labels.
     """
 
     lpns_set = set()
     pcs_map = {}
-
-    lpn_pattern = re.compile(r"^\d{8,12}$")
 
     for pdf in pdf_files:
         reader = PdfReader(pdf)
@@ -57,36 +55,39 @@ def extract_lpn_and_pcs_from_pdfs(pdf_files):
             if not text:
                 continue
 
-            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            # Extract ALL numeric tokens in order
+            numbers = re.findall(r"\d+(?:\.\d+)?", text)
 
-            for line in lines:
-                # Split PDF table rows on multiple spaces or tabs
-                parts = re.split(r"\s{2,}|\t", line)
-
-                # Find LPN cell
-                lpn_candidates = [p for p in parts if lpn_pattern.match(p)]
-                if not lpn_candidates:
-                    continue
-
-                lpn = lpn_candidates[0]
-
+            cleaned = []
+            for n in numbers:
                 try:
-                    lpn_index = parts.index(lpn)
-                    pieces_candidate = parts[lpn_index + 1]
-
-                    if pieces_candidate.isdigit():
-                        lpns_set.add(lpn)
-                        pcs_map[lpn] = pieces_candidate
-
-                except Exception:
+                    cleaned.append(int(float(n)))
+                except:
                     continue
+
+            for i, val in enumerate(cleaned):
+                # LPN = long numeric ID
+                if 8 <= len(str(val)) <= 12:
+                    lpn = str(val)
+                    lpns_set.add(lpn)
+
+                    # Look forward for PCS
+                    pcs_candidate = None
+                    for j in range(i + 1, min(i + 8, len(cleaned))):
+                        pcs_val = cleaned[j]
+                        if 1 <= pcs_val <= 5000:
+                            pcs_candidate = pcs_val
+                            break
+
+                    if pcs_candidate is not None:
+                        pcs_map[lpn] = str(pcs_candidate)
 
     return lpns_set, pcs_map
 
 
-# --------------------------------------------------
-# SKU Logic
-# --------------------------------------------------
+# ==================================================
+# SKU LOGIC
+# ==================================================
 def map_description(grade):
     grade = str(grade).upper()
     if "APG" in grade:
@@ -101,17 +102,16 @@ def map_description(grade):
 def sku_is_valid(val):
     if pd.isna(val):
         return False
-    val = str(val).strip().upper()
-    return val not in ("", "NAN", "NONE")
+    return str(val).strip() not in ("", "NAN", "NONE")
 
 
 def load_sku_lookup(sku_file):
     REQUIRED = {
         "SKU": ["SKU"],
-        "DESCRIPTION": ["DESCRIPTION", "DESC", "GRADE DESC", "PRODUCT DESCRIPTION"],
-        "THICKNESS": ["THICKNESS", "THK", "THICK"],
+        "DESCRIPTION": ["DESCRIPTION", "DESC"],
+        "THICKNESS": ["THICKNESS", "THK"],
         "WIDTH": ["WIDTH", "W"],
-        "LENGTH": ["LENGTH", "LEN", "L"]
+        "LENGTH": ["LENGTH", "LEN"]
     }
 
     xls = pd.ExcelFile(sku_file)
@@ -120,17 +120,16 @@ def load_sku_lookup(sku_file):
         df = xls.parse(sheet, dtype=str)
         df.columns = df.columns.str.upper().str.strip()
 
-        column_map = {}
-        for canonical, aliases in REQUIRED.items():
-            for alias in aliases:
-                if alias in df.columns:
-                    column_map[alias] = canonical
+        col_map = {}
+        for canon, aliases in REQUIRED.items():
+            for a in aliases:
+                if a in df.columns:
+                    col_map[a] = canon
                     break
 
-        if set(column_map.values()) == set(REQUIRED.keys()):
-            df = df.rename(columns=column_map).fillna("")
+        if set(col_map.values()) == set(REQUIRED.keys()):
+            df = df.rename(columns=col_map).fillna("")
             df["DESCRIPTION"] = df["DESCRIPTION"].str.upper().str.strip()
-
             df["MATCH KEY"] = (
                 df["DESCRIPTION"] + "|" +
                 df["THICKNESS"] + "|" +
@@ -142,26 +141,26 @@ def load_sku_lookup(sku_file):
     raise ValueError("SKU lookup missing required columns")
 
 
-# --------------------------------------------------
-# Main Processor
-# --------------------------------------------------
+# ==================================================
+# MAIN PROCESS
+# ==================================================
 def process_all(container_file, sku_file, pdf_files):
 
     raw_df = pd.read_excel(container_file, header=None, dtype=str)
     df = normalize_headers(raw_df).fillna("")
 
-    # -------- PDF READ --------
+    # -------- PDF --------
     lpns_set, pcs_map = extract_lpn_and_pcs_from_pdfs(pdf_files)
 
-    # -------- RECEIVE MATCH --------
-    df["PDF LPN"] = df["PACKAGEID"].apply(lambda x: x if str(x) in lpns_set else "")
-    df["RECEIVE MATCH"] = df["PACKAGEID"].apply(
-        lambda x: "YES" if str(x) in lpns_set else "NO"
+    df["PDF LPN"] = df["PACKAGEID"].astype(str).apply(
+        lambda x: x if x in lpns_set else ""
+    )
+    df["RECEIVE MATCH"] = df["PDF LPN"].apply(
+        lambda x: "YES" if x else "NO"
     )
 
-    # -------- PCS CHECK --------
-    df["PCS CHECK"] = df["PACKAGEID"].apply(
-        lambda x: pcs_map.get(str(x), "")
+    df["PCS CHECK"] = df["PACKAGEID"].astype(str).apply(
+        lambda x: pcs_map.get(x, "")
     )
 
     def pcs_match(container_pcs, pdf_pcs):
@@ -175,9 +174,8 @@ def process_all(container_file, sku_file, pdf_files):
         axis=1
     )
 
-    # -------- SKU MATCH --------
+    # -------- SKU --------
     sku_df = load_sku_lookup(sku_file)
-
     df["MAPPED DESCRIPTION"] = df["GRADE"].apply(map_description)
     df["MATCH KEY"] = (
         df["MAPPED DESCRIPTION"] + "|" +
@@ -192,42 +190,40 @@ def process_all(container_file, sku_file, pdf_files):
         on="MATCH KEY"
     )
 
-    df["MATCH"] = df["SKU"].apply(lambda x: "YES" if sku_is_valid(x) else "NO")
-    df["SKU"] = df["SKU"].apply(lambda x: str(x).strip() if sku_is_valid(x) else "")
+    df["MATCH"] = df["SKU"].apply(
+        lambda x: "YES" if sku_is_valid(x) else "NO"
+    )
+    df["SKU"] = df["SKU"].apply(
+        lambda x: str(x).strip() if sku_is_valid(x) else ""
+    )
 
-    # -------- COLUMN ORDER --------
+    # -------- ORDER --------
     audit_cols = [
-        "PDF LPN",
-        "RECEIVE MATCH",
-        "PCS CHECK",
-        "PCS MATCH",
-        "SKU",
-        "MATCH"
+        "PDF LPN", "RECEIVE MATCH",
+        "PCS CHECK", "PCS MATCH",
+        "SKU", "MATCH"
     ]
-
     existing = [c for c in audit_cols if c in df.columns]
     others = [c for c in df.columns if c not in existing]
-    df = df[others + existing]
-
-    return df
+    return df[others + existing]
 
 
-# --------------------------------------------------
-# UI Styling
-# --------------------------------------------------
+# ==================================================
+# UI HIGHLIGHTING
+# ==================================================
 def highlight_mismatches(row):
     if (
-        row.get("RECEIVE MATCH") != "YES"
-        or row.get("PCS MATCH") != "YES"
-        or row.get("MATCH") != "YES"
+        row["RECEIVE MATCH"] != "YES"
+        or row["PCS MATCH"] != "YES"
+        or row["MATCH"] != "YES"
     ):
-        return ["background-color: #ffcccc"] * len(row)
+        return ["background-color:#ffcccc"] * len(row)
     return [""] * len(row)
 
 
-# --------------------------------------------------
-# Streamlit UI
-# --------------------------------------------------
+# ==================================================
+# STREAMLIT UI
+# ==================================================
 st.set_page_config(page_title="BIFP Import Checker", layout="wide")
 st.title("📦 BIFP SKU + Receive + PCS Audit Tool")
 
@@ -240,12 +236,14 @@ if container_file and sku_file and pdf_files:
         st.session_state.processed_df = process_all(
             container_file, sku_file, pdf_files
         )
-        st.success("Processing completed")
+        st.success("Processing complete")
 
-        styled_df = st.session_state.processed_df.style.apply(
-            highlight_mismatches, axis=1
+        st.dataframe(
+            st.session_state.processed_df.style.apply(
+                highlight_mismatches, axis=1
+            ),
+            use_container_width=True
         )
-        st.dataframe(styled_df, use_container_width=True)
 
         st.download_button(
             "⬇️ Download Audit Excel",
@@ -255,7 +253,9 @@ if container_file and sku_file and pdf_files:
 
 st.divider()
 
-# ---------------- Sales Assist ----------------
+# ==================================================
+# SALES ASSIST EXPORT
+# ==================================================
 st.header("Sales Assist Export")
 
 sa_name = st.text_input(
@@ -263,31 +263,24 @@ sa_name = st.text_input(
     value="Sales_Assist"
 )
 
-if st.session_state.processed_df is None:
-    st.info("Run the full process before generating Sales Assist.")
-
 if st.session_state.processed_df is not None and st.button("Generate Sales Assist Excel"):
+    df = st.session_state.processed_df
     sa_df = pd.DataFrame({
-        "SKU": st.session_state.processed_df.get("SKU", ""),
-        "Pieces": pd.to_numeric(st.session_state.processed_df.get("PCS", 0), errors="coerce").fillna(0),
-        "Quantity": pd.to_numeric(st.session_state.processed_df.get("QTY", 0), errors="coerce").fillna(0),
+        "SKU": df["SKU"],
+        "Pieces": pd.to_numeric(df["PCS"], errors="coerce").fillna(0),
+        "Quantity": pd.to_numeric(df["QTY"], errors="coerce").fillna(0),
         "QuantityUOM": "BF",
         "PriceUOM": "MBF",
         "PricePerUOM": 0,
         "OrderNumber": pd.to_numeric(
-            st.session_state.processed_df.get("ORDERNUMBER", "").astype(str).str.split("-").str[0],
+            df["ORDERNUMBER"].astype(str).str.split("-").str[0],
             errors="coerce"
         ).fillna(0),
-        "ContainerNumber": st.session_state.processed_df.get("CONTAINER", ""),
+        "ContainerNumber": df["CONTAINER"],
         "ReloadReference": "",
-        "Identifier": pd.to_numeric(
-            st.session_state.processed_df.get("PACKAGEID", 0),
-            errors="coerce"
-        ).fillna(0),
+        "Identifier": pd.to_numeric(df["PACKAGEID"], errors="coerce").fillna(0),
         "ProFormaPrice": 0
     })
-
-    st.success("Sales Assist report generated")
 
     st.download_button(
         "⬇️ Download Sales Assist Excel",
