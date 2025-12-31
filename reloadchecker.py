@@ -79,29 +79,66 @@ def map_description(grade):
     return "DOG EAR"
 
 
+def sku_is_valid(val):
+    if pd.isna(val):
+        return False
+    val = str(val).strip().upper()
+    return val not in ("", "NAN", "NONE")
+
+
 def load_sku_lookup(sku_file):
+    """
+    Loads SKU lookup with tolerant header matching.
+    Normalizes to:
+    SKU, DESCRIPTION, THICKNESS, WIDTH, LENGTH
+    """
+
+    REQUIRED = {
+        "SKU": ["SKU"],
+        "DESCRIPTION": ["DESCRIPTION", "DESC", "GRADE DESC", "PRODUCT DESCRIPTION"],
+        "THICKNESS": ["THICKNESS", "THK", "THICK"],
+        "WIDTH": ["WIDTH", "W"],
+        "LENGTH": ["LENGTH", "LEN", "L"]
+    }
+
     xls = pd.ExcelFile(sku_file)
+
     for sheet in xls.sheet_names:
         df = xls.parse(sheet, dtype=str)
         df.columns = df.columns.str.upper().str.strip()
-        if {"SKU", "DESCRIPTION", "THICKNESS", "WIDTH", "LENGTH"}.issubset(df.columns):
+
+        column_map = {}
+
+        for canonical, aliases in REQUIRED.items():
+            for alias in aliases:
+                if alias in df.columns:
+                    column_map[alias] = canonical
+                    break
+
+        if set(column_map.values()) == set(REQUIRED.keys()):
+            df = df.rename(columns=column_map)
             df = df.fillna("")
+
             df["DESCRIPTION"] = df["DESCRIPTION"].str.upper().str.strip()
+
             df["MATCH KEY"] = (
                 df["DESCRIPTION"] + "|" +
                 df["THICKNESS"] + "|" +
                 df["WIDTH"] + "|" +
                 df["LENGTH"]
             )
+
             return df
-    raise ValueError("SKU lookup missing required columns")
 
-
-def sku_is_valid(val):
-    if pd.isna(val):
-        return False
-    val = str(val).strip().upper()
-    return val not in ("", "NAN", "NONE")
+    raise ValueError(
+        "SKU lookup missing required columns.\n"
+        "Expected one of each:\n"
+        "- SKU\n"
+        "- DESCRIPTION (or DESC)\n"
+        "- THICKNESS (or THK)\n"
+        "- WIDTH (or W)\n"
+        "- LENGTH (or LEN)"
+    )
 
 
 # --------------------------------------------------
@@ -180,7 +217,7 @@ def process_all(container_file, sku_file, pdf_files):
 
 
 # --------------------------------------------------
-# UI Styling (RED ROWS ON ANY MISMATCH)
+# UI Styling
 # --------------------------------------------------
 def highlight_mismatches(row):
     if (
@@ -195,8 +232,8 @@ def highlight_mismatches(row):
 # --------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------
-st.set_page_config(page_title="SKU + Receive + PCS Audit", layout="wide")
-st.title("📦 SKU + Receive + PCS Audit Tool")
+st.set_page_config(page_title="BIFP Import Checker", layout="wide")
+st.title("📦 BIFP SKU + Receive + PCS Audit Tool")
 
 container_file = st.file_uploader("Upload Container List Excel", type="xlsx")
 sku_file = st.file_uploader("Upload SKU Lookup Excel", type="xlsx")
