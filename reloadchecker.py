@@ -35,69 +35,96 @@ def normalize_headers(df):
     return df.iloc[header_row + 1:].reset_index(drop=True)
 
 
-def norm_digits(x):
-    """Normalize things like 7052583281.0 -> 7052583281 and strip whitespace."""
-    s = "" if pd.isna(x) else str(x).strip()
-    s = re.sub(r"\.0$", "", s)
-    return s
+def norm_id(x):
+    """
+    Normalize IDs like:
+    - 7052583281.0 -> 7052583281
+    - '7052583281  -> 7052583281
+    - 7.05258E+09  -> 7052583281
+    """
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    if s.startswith("'"):
+        s = s[1:].strip()
+    s = s.replace(",", "")
+
+    # handle scientific/float-like safely
+    try:
+        f = float(s)
+        if f.is_integer():
+            s = str(int(f))
+    except:
+        pass
+
+    m = re.search(r"\d{8,12}", s)
+    return m.group(0) if m else s
+
+
+def norm_int_str(x):
+    """Normalize integer-like strings; blank if not parseable."""
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    if s.startswith("'"):
+        s = s[1:].strip()
+    s = s.replace(",", "")
+    try:
+        return str(int(float(s)))
+    except:
+        return ""
 
 
 # --------------------------------------------------
-# PDF Logic (ONE PASS: LPN + PIECES)
+# LPN / PDF Logic (KEEP YOUR WORKING LPN EXTRACTOR)
 # --------------------------------------------------
-def extract_lpns_and_pieces_from_pdfs(pdf_files):
-    """
-    Returns:
-      lpns_set: set of LPNs found (8-12 digits)
-      pieces_map: dict {LPN: PIECES} extracted by proximity after each LPN
-    NOTE: We read each PDF from BytesIO(pdf.getvalue()) so we never hit EOF pointer issues.
-    """
+def extract_lpns_from_pdfs(pdf_files):
     lpns = set()
-    pieces_map = {}
+    pattern = re.compile(r"\b\d{8,12}\b")
 
-    lpn_pat = re.compile(r"\b\d{8,12}\b")
-    num_token_pat = re.compile(r"\d+(?:\.\d+)?")  # integers + decimals
+    for pdf in pdf_files:
+        # Use BytesIO(pdf.getvalue()) so we never get file-pointer issues
+        reader = PdfReader(BytesIO(pdf.getvalue()))
+        for page in reader.pages:
+            text = page.extract_text()
+            if text:
+                lpns.update(pattern.findall(text))
+    return lpns
+
+
+# --------------------------------------------------
+# PCS / PIECES from PDF Logic (NEW, BASED ON YOUR EXTRACTED TEXT)
+# --------------------------------------------------
+def extract_pcs_map_from_pdfs(pdf_files):
+    """
+    Extract PCS/PIECES by matching the pattern you pasted:
+      LPN  PIECES  TOTAL_LBS
+    Example:
+      7052583281 240 1120.0000
+
+    Returns dict: {LPN: PIECES}
+    """
+    pcs_map = {}
+
+    # LPN (8–12 digits) + PIECES (1–5 digits) + TOTAL LBS (decimal)
+    row_pattern = re.compile(r"\b(\d{8,12})\b\s+(\d{1,5})\b\s+\d+(?:\.\d+)?")
 
     for pdf in pdf_files:
         reader = PdfReader(BytesIO(pdf.getvalue()))
-
         for page in reader.pages:
             text = page.extract_text()
             if not text:
                 continue
 
-            # --- LPNs (this is the SAME logic you had before, just done in the shared loop)
-            page_lpns = lpn_pat.findall(text)
-            lpns.update(page_lpns)
+            # Collapse whitespace so row regex works even if the PDF breaks lines oddly
+            flat = re.sub(r"\s+", " ", text)
 
-            # --- PIECES per LPN (works even when table spacing/lines are weird)
-            # For every LPN occurrence, look ahead for the first *integer* token (no decimal) that looks like a PCS count.
-            for m in lpn_pat.finditer(text):
-                lpn = m.group(0)
+            for lpn, pieces in row_pattern.findall(flat):
+                # keep first seen; if repeats exist they should be same
+                if lpn not in pcs_map:
+                    pcs_map[lpn] = pieces
 
-                # Look ahead a bit after the LPN occurrence
-                tail = text[m.end(): m.end() + 250]
-                tokens = num_token_pat.findall(tail)
-
-                pieces_val = None
-                for t in tokens:
-                    # Skip decimals like 1120.0000 (TOTAL LBS)
-                    if "." in t:
-                        continue
-                    try:
-                        v = int(t)
-                    except:
-                        continue
-
-                    # Reasonable bounds for PIECES
-                    if 1 <= v <= 5000:
-                        pieces_val = str(v)
-                        break
-
-                if pieces_val and lpn not in pieces_map:
-                    pieces_map[lpn] = pieces_val
-
-    return lpns, pieces_map
+    return pcs_map
 
 
 # --------------------------------------------------
@@ -115,12 +142,29 @@ def map_description(grade):
 
 
 def load_sku_lookup(sku_file):
+    # Slightly more tolerant than strict, but still safe
+    REQUIRED = {
+        "SKU": ["SKU"],
+        "DESCRIPTION": ["DESCRIPTION", "DESC", "PRODUCT DESCRIPTION", "GRADE DESC"],
+        "THICKNESS": ["THICKNESS", "THK"],
+        "WIDTH": ["WIDTH", "W"],
+        "LENGTH": ["LENGTH", "LEN", "L"]
+    }
+
     xls = pd.ExcelFile(sku_file)
     for sheet in xls.sheet_names:
         df = xls.parse(sheet, dtype=str)
         df.columns = df.columns.str.upper().str.strip()
-        if {"SKU", "DESCRIPTION", "THICKNESS", "WIDTH", "LENGTH"}.issubset(df.columns):
-            df = df.fillna("")
+
+        col_map = {}
+        for canon, aliases in REQUIRED.items():
+            for a in aliases:
+                if a in df.columns:
+                    col_map[a] = canon
+                    break
+
+        if set(col_map.values()) == set(REQUIRED.keys()):
+            df = df.rename(columns=col_map).fillna("")
             df["DESCRIPTION"] = df["DESCRIPTION"].str.upper().str.strip()
             df["MATCH KEY"] = (
                 df["DESCRIPTION"] + "|" +
@@ -129,7 +173,8 @@ def load_sku_lookup(sku_file):
                 df["LENGTH"]
             )
             return df
-    raise ValueError("SKU lookup missing required columns")
+
+    raise ValueError("SKU lookup missing required columns (SKU/DESCRIPTION/THICKNESS/WIDTH/LENGTH).")
 
 
 def sku_is_valid(val):
@@ -146,20 +191,24 @@ def process_all(container_file, sku_file, pdf_files):
     raw_df = pd.read_excel(container_file, header=None, dtype=str)
     df = normalize_headers(raw_df).fillna("")
 
-    # Normalize key fields
-    if "PACKAGEID" in df.columns:
-        df["PACKAGEID"] = df["PACKAGEID"].apply(norm_digits)
-    if "PCS" in df.columns:
-        df["PCS"] = df["PCS"].apply(norm_digits)
+    # Validate required columns in container list
+    required_cols = {"PACKAGEID", "PCS", "GRADE", "THICKNESS", "WIDTH", "LENGTH"}
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Container list missing required columns: {missing}")
 
-    # --- Receive Match + PCS Check (from PDFs in one pass)
-    lpns, pieces_map = extract_lpns_and_pieces_from_pdfs(pdf_files)
+    # Normalize keys
+    df["PACKAGEID"] = df["PACKAGEID"].apply(norm_id)
+    df["PCS"] = df["PCS"].apply(norm_int_str)
 
+    # --- Receive Match (LPN)
+    lpns = extract_lpns_from_pdfs(pdf_files)
     df["PDF LPN"] = df["PACKAGEID"].apply(lambda x: x if x in lpns else "")
     df["RECEIVE MATCH"] = df["PACKAGEID"].apply(lambda x: "YES" if x in lpns else "NO")
 
-    # PCS CHECK = value from PDFs
-    df["PCS CHECK"] = df["PACKAGEID"].apply(lambda x: pieces_map.get(x, ""))
+    # --- PCS Check
+    pcs_map = extract_pcs_map_from_pdfs(pdf_files)
+    df["PCS CHECK"] = df["PACKAGEID"].apply(lambda x: pcs_map.get(x, ""))
 
     def pcs_match(container_pcs, pdf_pcs):
         try:
@@ -190,7 +239,7 @@ def process_all(container_file, sku_file, pdf_files):
 
     df["MATCH"] = df["SKU"].apply(lambda x: "YES" if sku_is_valid(x) else "NO")
 
-    # Optional: audit-friendly ordering of the key columns at the end
+    # --- Audit-friendly ordering (put audit columns at the end)
     audit_cols = ["PDF LPN", "RECEIVE MATCH", "PCS CHECK", "PCS MATCH", "SKU", "MATCH"]
     existing_audit = [c for c in audit_cols if c in df.columns]
     others = [c for c in df.columns if c not in existing_audit]
@@ -226,6 +275,20 @@ def generate_sales_assist(df):
 
 
 # --------------------------------------------------
+# UI Styling: Red rows if any mismatch
+# --------------------------------------------------
+def highlight_mismatches(row):
+    # Any NO triggers red row
+    if (
+        row.get("RECEIVE MATCH") != "YES"
+        or row.get("PCS MATCH") != "YES"
+        or row.get("MATCH") != "YES"
+    ):
+        return ["background-color: #ffcccc"] * len(row)
+    return [""] * len(row)
+
+
+# --------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------
 st.set_page_config(page_title="SKU + Receive + PCS Match + Sales Assist", layout="wide")
@@ -242,22 +305,13 @@ if container_file and sku_file and pdf_files:
         )
         st.success("Full process completed")
 
-        # quick stats
-        dfp = st.session_state.processed_df
-        st.write(
-            {
-                "Rows": len(dfp),
-                "Receive NO": int((dfp["RECEIVE MATCH"] == "NO").sum()) if "RECEIVE MATCH" in dfp.columns else None,
-                "PCS MATCH NO": int((dfp["PCS MATCH"] == "NO").sum()) if "PCS MATCH" in dfp.columns else None,
-                "SKU MATCH NO": int((dfp["MATCH"] == "NO").sum()) if "MATCH" in dfp.columns else None,
-            }
-        )
-
-        st.dataframe(dfp.head(100), use_container_width=True)
+        # Styled view (red mismatches)
+        styled = st.session_state.processed_df.style.apply(highlight_mismatches, axis=1)
+        st.dataframe(styled, use_container_width=True)
 
         st.download_button(
             "⬇️ Download SKU + Receive + PCS Match Excel",
-            to_excel_bytes(dfp),
+            to_excel_bytes(st.session_state.processed_df),
             container_file.name.replace(".xlsx", "_SKU_RECEIVE_PCS_MATCH.xlsx")
         )
 
