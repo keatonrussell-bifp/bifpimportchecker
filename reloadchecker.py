@@ -91,14 +91,37 @@ def series_digits_only(s: pd.Series) -> bool:
 # SKU Logic
 # ==================================================
 def map_description(grade) -> str:
-    grade = str(grade).upper()
-    if "APG" in grade:
-        return "TAEDA PINE APG"
-    if "DOG" in grade:
+    """
+    Maps container/PDF grade text to SKU lookup DESCRIPTION.
+
+    Rules:
+      - If grade blank -> DOG EAR
+      - If contains APG -> TAEDA PINE APG
+      - If contains DOG -> DOG EAR
+      - If contains III or III/V or 3COM -> TAEDA PINE #3 COMMON
+      - If contains D-Grade / GS-D-Grade / D GRADE -> TAEDA PINE D
+      - Otherwise -> "" (don’t guess)
+    """
+    g = "" if pd.isna(grade) else str(grade).strip().upper()
+
+    if g == "":
         return "DOG EAR"
-    if re.search(r"\bIII/V\b|\bIII\b|\b3COM\b", grade):
+
+    # --- NEW: D-grade mapping ---
+    # catches: "GS-D-GRADE", "D-GRADE", "D GRADE", "GRADE D", etc.
+    if re.search(r"\bD[-\s]?GRADE\b|\bGS[-\s]?D[-\s]?GRADE\b|\bGRADE[-\s]?D\b", g):
+        return "TAEDA PINE D"
+
+    if "APG" in g:
+        return "TAEDA PINE APG"
+
+    if "DOG" in g:
+        return "DOG EAR"
+
+    if re.search(r"\bIII/V\b|\bIII\b|\b3COM\b", g):
         return "TAEDA PINE #3 COMMON"
-    return "DOG EAR"  # default
+
+    return ""
 
 
 def sku_is_valid(val) -> bool:
@@ -565,3 +588,4 @@ with tab2:
                 to_excel_bytes(st.session_state.pdf_sa_df),
                 f"{sa_name_pdf}.xlsx"
             )
+
