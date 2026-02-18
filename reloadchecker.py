@@ -106,7 +106,7 @@ def map_description(grade) -> str:
 
     if g == "":
         return "DOG EAR"
-
+    
     # --- NEW: D-grade mapping ---
     # catches: "GS-D-GRADE", "D-GRADE", "D GRADE", "GRADE D", etc.
     if re.search(r"\bD[-\s]?GRADE\b|\bGS[-\s]?D[-\s]?GRADE\b|\bGRADE[-\s]?D\b", g):
@@ -116,6 +116,9 @@ def map_description(grade) -> str:
         return "TAEDA PINE APG"
 
     if "DOG" in g:
+        return "DOG EAR"
+
+    if "FENCE" in g:
         return "DOG EAR"
 
     if re.search(r"\bIII/V\b|\bIII\b|\b3COM\b", g):
@@ -588,4 +591,5 @@ with tab2:
                 to_excel_bytes(st.session_state.pdf_sa_df),
                 f"{sa_name_pdf}.xlsx"
             )
+
 
