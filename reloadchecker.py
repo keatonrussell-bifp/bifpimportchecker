@@ -61,7 +61,7 @@ def norm_id(x) -> str:
         f = float(s)
         if f.is_integer():
             return str(int(f))
-    except:
+    except Exception:
         pass
 
     return s
@@ -76,7 +76,7 @@ def norm_int_str(x) -> str:
     s = s.replace(",", "")
     try:
         return str(int(float(s)))
-    except:
+    except Exception:
         return ""
 
 
@@ -85,6 +85,18 @@ def series_digits_only(s: pd.Series) -> bool:
     if len(s) == 0:
         return True
     return s.str.fullmatch(r"\d+").all()
+
+
+def col_or_default(df: pd.DataFrame, col: str, default):
+    """
+    Always return a Series aligned to df.index.
+    Prevents .fillna errors when df.get(col, scalar) would return a scalar.
+    """
+    if df is None:
+        return pd.Series([], dtype="object")
+    if col in df.columns:
+        return df[col]
+    return pd.Series([default] * len(df), index=df.index)
 
 
 # ==================================================
@@ -98,6 +110,7 @@ def map_description(grade) -> str:
       - If grade blank -> DOG EAR
       - If contains APG -> TAEDA PINE APG
       - If contains DOG -> DOG EAR
+      - If contains FENCE -> DOG EAR
       - If contains III or III/V or 3COM -> TAEDA PINE #3 COMMON
       - If contains D-Grade / GS-D-Grade / D GRADE -> TAEDA PINE D
       - Otherwise -> "" (don’t guess)
@@ -106,9 +119,8 @@ def map_description(grade) -> str:
 
     if g == "":
         return "DOG EAR"
-    
-    # --- NEW: D-grade mapping ---
-    # catches: "GS-D-GRADE", "D-GRADE", "D GRADE", "GRADE D", etc.
+
+    # D-grade mapping
     if re.search(r"\bD[-\s]?GRADE\b|\bGS[-\s]?D[-\s]?GRADE\b|\bGRADE[-\s]?D\b", g):
         return "TAEDA PINE D"
 
@@ -159,10 +171,10 @@ def load_sku_lookup(sku_file) -> pd.DataFrame:
             df = df.rename(columns=col_map).fillna("")
             df["DESCRIPTION"] = df["DESCRIPTION"].str.upper().str.strip()
             df["MATCH KEY"] = (
-                df["DESCRIPTION"] + "|" +
-                df["THICKNESS"] + "|" +
-                df["WIDTH"] + "|" +
-                df["LENGTH"]
+                df["DESCRIPTION"] + "|"
+                + df["THICKNESS"] + "|"
+                + df["WIDTH"] + "|"
+                + df["LENGTH"]
             )
             return df
 
@@ -270,8 +282,10 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
                 if len(parts) != 3:
                     continue
                 try:
-                    thk = int(parts[0]); wid = int(parts[1]); leng = int(parts[2])
-                except:
+                    thk = int(parts[0])
+                    wid = int(parts[1])
+                    leng = int(parts[2])
+                except Exception:
                     continue
 
                 # grade can be multi-token (DOG EAR), so join everything before DIM
@@ -302,32 +316,33 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
 
                         bonus = 0
                         if package_id_whitelist is not None and tok in package_id_whitelist:
-                            bonus = 100  # force-match if it exists in container list
+                            bonus = 100
 
                         candidates.append((tok, bonus + score, abs(off)))
 
                 if not candidates:
                     continue
 
-                # best: highest score, then closest distance
                 candidates.sort(key=lambda x: (-x[1], x[2]))
                 package_id = candidates[0][0]
 
                 # compute BF quantity
                 qty = int(round(pieces * (thk * wid * leng) / 144.0))
 
-                rows.append({
-                    "PACKAGEID": package_id,
-                    "PCS": pieces,
-                    "QTY": qty,
-                    "GRADE": grade,
-                    "THICKNESS": str(thk),
-                    "WIDTH": str(wid),
-                    "LENGTH": str(leng),
-                    "CONTAINER": container,
-                    "ORDERNUMBER": order,
-                    "PDF_FILE": pdf.name
-                })
+                rows.append(
+                    {
+                        "PACKAGEID": package_id,
+                        "PCS": pieces,
+                        "QTY": qty,
+                        "GRADE": grade,
+                        "THICKNESS": str(thk),
+                        "WIDTH": str(wid),
+                        "LENGTH": str(leng),
+                        "CONTAINER": container,
+                        "ORDERNUMBER": order,
+                        "PDF_FILE": pdf.name,
+                    }
+                )
 
     return pd.DataFrame(rows)
 
@@ -350,17 +365,13 @@ def process_all(container_file, sku_file, pdf_files):
 
     package_whitelist = set(df["PACKAGEID"].astype(str))
 
-    # parse PDFs once into line-items (supports both formats)
+    # parse PDFs once into line-items
     pdf_items = parse_pdfs_line_items(pdf_files, package_id_whitelist=package_whitelist)
 
     pdf_lpns = set(pdf_items["PACKAGEID"].astype(str)) if not pdf_items.empty else set()
     pcs_map = {}
     if not pdf_items.empty:
-        pcs_map = (
-            pdf_items.groupby("PACKAGEID")["PCS"]
-            .first()
-            .to_dict()
-        )
+        pcs_map = pdf_items.groupby("PACKAGEID")["PCS"].first().to_dict()
 
     df["PDF LPN"] = df["PACKAGEID"].astype(str).apply(lambda x: x if x in pdf_lpns else "")
     df["RECEIVE MATCH"] = df["PACKAGEID"].astype(str).apply(lambda x: "YES" if x in pdf_lpns else "NO")
@@ -370,7 +381,7 @@ def process_all(container_file, sku_file, pdf_files):
     def pcs_match(container_pcs, pdf_pcs):
         try:
             return "YES" if int(container_pcs) == int(pdf_pcs) else "NO"
-        except:
+        except Exception:
             return "NO"
 
     df["PCS MATCH"] = df.apply(lambda r: pcs_match(r.get("PCS", ""), r.get("PCS CHECK", "")), axis=1)
@@ -379,10 +390,10 @@ def process_all(container_file, sku_file, pdf_files):
     sku_df = load_sku_lookup(sku_file)
     df["MAPPED DESCRIPTION"] = df["GRADE"].apply(map_description)
     df["MATCH KEY"] = (
-        df["MAPPED DESCRIPTION"] + "|" +
-        df["THICKNESS"].astype(str) + "|" +
-        df["WIDTH"].astype(str) + "|" +
-        df["LENGTH"].astype(str)
+        df["MAPPED DESCRIPTION"] + "|"
+        + df["THICKNESS"].astype(str) + "|"
+        + df["WIDTH"].astype(str) + "|"
+        + df["LENGTH"].astype(str)
     )
 
     df = df.merge(sku_df[["SKU", "MATCH KEY"]], how="left", on="MATCH KEY")
@@ -430,34 +441,52 @@ def fix_pcs_mismatch_use_container_truth(df: pd.DataFrame):
 
 
 # ==================================================
-# Sales Assist Generator (supports numeric OR alphanumeric identifiers)
+# Sales Assist Generator (robust: works with/without QTY col)
 # ==================================================
 def generate_sales_assist(df: pd.DataFrame) -> pd.DataFrame:
-    order_str = df.get("ORDERNUMBER", "").astype(str).str.split("-").str[0].str.strip()
-    if series_digits_only(order_str):
-        order_out = pd.to_numeric(order_str, errors="coerce").fillna(0).astype(int)
+    # OrderNumber (strip suffix -2 etc. when numeric)
+    order_raw = col_or_default(df, "ORDERNUMBER", "").astype(str).str.split("-").str[0].str.strip()
+    if series_digits_only(order_raw):
+        order_out = pd.to_numeric(order_raw, errors="coerce").fillna(0).astype(int)
     else:
-        order_out = order_str
+        order_out = order_raw
 
-    ident_str = df.get("PACKAGEID", "").astype(str).str.strip()
-    if series_digits_only(ident_str):
-        ident_out = pd.to_numeric(ident_str, errors="coerce").fillna(0).astype(int)
+    # Identifier (PACKAGEID can be numeric or alphanumeric)
+    ident_raw = col_or_default(df, "PACKAGEID", "").astype(str).str.strip()
+    if series_digits_only(ident_raw):
+        ident_out = pd.to_numeric(ident_raw, errors="coerce").fillna(0).astype(int)
     else:
-        ident_out = ident_str
+        ident_out = ident_raw
 
-    return pd.DataFrame({
-        "SKU": df.get("SKU", ""),
-        "Pieces": pd.to_numeric(df.get("PCS", 0), errors="coerce").fillna(0).astype(int),
-        "Quantity": pd.to_numeric(df.get("QTY", 0), errors="coerce").fillna(0).astype(int),
-        "QuantityUOM": "BF",
-        "PriceUOM": "MBF",
-        "PricePerUOM": 0,
-        "OrderNumber": order_out,
-        "ContainerNumber": df.get("CONTAINER", ""),
-        "ReloadReference": "",
-        "Identifier": ident_out,
-        "ProFormaPrice": 0
-    })
+    # Pieces
+    pcs = pd.to_numeric(col_or_default(df, "PCS", 0), errors="coerce").fillna(0).astype(int)
+
+    # Quantity BF:
+    # - If QTY exists, use it
+    # - Else compute from PCS * (THK*WID*LEN)/144
+    if "QTY" in df.columns:
+        qty = pd.to_numeric(df["QTY"], errors="coerce").fillna(0).astype(int)
+    else:
+        thk = pd.to_numeric(col_or_default(df, "THICKNESS", 0), errors="coerce").fillna(0)
+        wid = pd.to_numeric(col_or_default(df, "WIDTH", 0), errors="coerce").fillna(0)
+        leng = pd.to_numeric(col_or_default(df, "LENGTH", 0), errors="coerce").fillna(0)
+        qty = (pcs * (thk * wid * leng) / 144.0).round().fillna(0).astype(int)
+
+    return pd.DataFrame(
+        {
+            "SKU": col_or_default(df, "SKU", ""),
+            "Pieces": pcs,
+            "Quantity": qty,
+            "QuantityUOM": "BF",
+            "PriceUOM": "MBF",
+            "PricePerUOM": 0,
+            "OrderNumber": order_out,
+            "ContainerNumber": col_or_default(df, "CONTAINER", ""),
+            "ReloadReference": "",
+            "Identifier": ident_out,
+            "ProFormaPrice": 0,
+        }
+    )
 
 
 # ==================================================
@@ -535,7 +564,7 @@ with tab1:
                 st.download_button(
                     "⬇️ Download Sales Assist Excel",
                     to_excel_bytes(sa_df),
-                    f"{sa_name}.xlsx"
+                    f"{sa_name}.xlsx",
                 )
 
 
@@ -562,16 +591,16 @@ with tab2:
 
                 items_df["MAPPED DESCRIPTION"] = items_df["GRADE"].apply(map_description)
                 items_df["MATCH KEY"] = (
-                    items_df["MAPPED DESCRIPTION"] + "|" +
-                    items_df["THICKNESS"].astype(str) + "|" +
-                    items_df["WIDTH"].astype(str) + "|" +
-                    items_df["LENGTH"].astype(str)
+                    items_df["MAPPED DESCRIPTION"] + "|"
+                    + items_df["THICKNESS"].astype(str) + "|"
+                    + items_df["WIDTH"].astype(str) + "|"
+                    + items_df["LENGTH"].astype(str)
                 )
 
                 items_df = items_df.merge(
                     sku_df[["SKU", "MATCH KEY"]],
                     how="left",
-                    on="MATCH KEY"
+                    on="MATCH KEY",
                 )
                 items_df["MATCH"] = items_df["SKU"].apply(lambda x: "YES" if sku_is_valid(x) else "NO")
 
@@ -589,7 +618,5 @@ with tab2:
             st.download_button(
                 "⬇️ Download Sales Assist Excel (PDF-only)",
                 to_excel_bytes(st.session_state.pdf_sa_df),
-                f"{sa_name_pdf}.xlsx"
+                f"{sa_name_pdf}.xlsx",
             )
-
-
