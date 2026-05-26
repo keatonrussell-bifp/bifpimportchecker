@@ -226,13 +226,24 @@ def extract_container_and_order(full_text: str, filename: str):
 # ==================================================
 # PDF Line Item Parser
 # ==================================================
+# ==================================================
+# PDF Line Item Parser
+# ==================================================
 def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
     """
-    Robust parser that works when:
-      - LPN is numeric OR alphanumeric
-      - PIECES can appear before or after the LPN
-      - Some PDFs list: GRADE DIM LPN PCS ...
-      - Others list: GRADE DIM PCS LPN ...
+    Robust parser that supports both:
+
+      1. Original format:
+           GRADE DIM LPN PCS ...
+           GRADE DIM PCS LPN ...
+
+      2. BUN warehouse receipt format:
+           APG 1x8x144 (BUN: 083 120 0.0000
+           APG 1x8x144 (BUN: 120083 0.0000
+
+         In BUN format:
+           LPN = 083
+           PCS = 120
 
     Returns columns:
       PACKAGEID, PCS, QTY, GRADE, THICKNESS, WIDTH, LENGTH, CONTAINER, ORDERNUMBER, PDF_FILE
@@ -240,10 +251,16 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
     dim_pat = re.compile(r"^\d+\s*[Xx]\s*\d+\s*[Xx]\s*\d+$")
     int_pat = re.compile(r"^\d+$")
 
+    def clean_token(tok: str) -> str:
+        return str(tok).strip().replace(",", "")
+
     def is_pieces(tok: str) -> bool:
+        tok = clean_token(tok)
         return bool(int_pat.fullmatch(tok)) and (1 <= int(tok) <= 5000)
 
     def id_pattern_score(tok: str) -> int:
+        tok = clean_token(tok)
+
         if "." in tok:
             return 0
         if dim_pat.match(tok):
@@ -255,6 +272,87 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
         if re.fullmatch(r"[A-Za-z]+[0-9]+[A-Za-z0-9]*", tok):
             return 1
         return 0
+
+    def parse_bun_payload(tokens_after_bun):
+        """
+        Handles BUN values after the BUN token.
+
+        Possible extracted layouts:
+
+          BUN: 083 120 0.0000
+          BUN: 120083 0.0000
+
+        Returns:
+          package_id, pieces
+        """
+        numeric_tokens = []
+
+        for tok in tokens_after_bun:
+            raw = str(tok).strip()
+
+            # Skip decimals like 0.0000
+            if re.fullmatch(r"\d+\.\d+", raw):
+                continue
+
+            clean = re.sub(r"[^0-9]", "", raw)
+
+            if clean:
+                numeric_tokens.append(clean)
+
+        if len(numeric_tokens) >= 2:
+            # Header says LPN then PIECES
+            package_id = numeric_tokens[0]
+            pieces = int(numeric_tokens[1])
+            return package_id, pieces
+
+        if len(numeric_tokens) == 1:
+            combined = numeric_tokens[0]
+
+            # Common BUN extraction issue:
+            #   120083 = PCS 120 + LPN 083
+            #   240165 = PCS 240 + LPN 165
+            #   160279 = PCS 160 + LPN 279
+            candidates = []
+
+            for pcs_len in range(1, min(4, len(combined)) + 1):
+                pcs_str = combined[:pcs_len]
+                lpn_str = combined[pcs_len:]
+
+                if not lpn_str:
+                    continue
+
+                try:
+                    pcs_int = int(pcs_str)
+                except Exception:
+                    continue
+
+                if not (1 <= pcs_int <= 5000):
+                    continue
+
+                score = 0
+
+                # These warehouse receipts use 3-digit LPNs
+                if len(lpn_str) == 3:
+                    score += 100
+
+                # Common lumber pack counts
+                if pcs_int in {
+                    60, 80, 96, 100, 120, 128, 144,
+                    160, 192, 200, 240, 256, 288, 300
+                }:
+                    score += 20
+
+                # Small tie-breaker for longer PCS prefix
+                score += pcs_len
+
+                candidates.append((score, lpn_str, pcs_int))
+
+            if candidates:
+                candidates.sort(reverse=True)
+                _, package_id, pieces = candidates[0]
+                return package_id, pieces
+
+        return None, None
 
     rows = []
 
@@ -268,9 +366,11 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
         for text in pages_text:
             for line in text.splitlines():
                 tokens = [t for t in line.strip().split() if t]
+
                 if len(tokens) < 4:
                     continue
 
+                # Find DIM token
                 dim_idx = None
                 for i, tok in enumerate(tokens):
                     if dim_pat.match(tok):
@@ -280,6 +380,7 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
                 if dim_idx is None:
                     continue
 
+                # Parse dimensions
                 dims = re.sub(r"\s+", "", tokens[dim_idx])
                 parts = re.split(r"[Xx]", dims)
 
@@ -293,9 +394,57 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
                 except Exception:
                     continue
 
+                # Grade can be multi-token, so join everything before DIM
                 grade = " ".join(tokens[:dim_idx]).strip()
 
+                # ==================================================
+                # Format 1: BUN warehouse receipt format
+                #
+                # Examples:
+                #   APG 1x8x144 (BUN: 083 120 0.0000
+                #   APG 1x8x144 (BUN: 120083 0.0000
+                # ==================================================
+                bun_idx = None
+
+                for i, tok in enumerate(tokens):
+                    if "BUN" in tok.upper():
+                        bun_idx = i
+                        break
+
+                if bun_idx is not None:
+                    package_id, pieces = parse_bun_payload(tokens[bun_idx + 1:])
+
+                    if package_id and pieces:
+                        qty = int(round(pieces * (thk * wid * leng) / 144.0))
+
+                        rows.append(
+                            {
+                                "PACKAGEID": package_id,
+                                "PCS": pieces,
+                                "QTY": qty,
+                                "GRADE": grade,
+                                "THICKNESS": str(thk),
+                                "WIDTH": str(wid),
+                                "LENGTH": str(leng),
+                                "CONTAINER": container,
+                                "ORDERNUMBER": order,
+                                "PDF_FILE": pdf.name,
+                            }
+                        )
+
+                        continue
+
+                # ==================================================
+                # Format 2: Original parser fallback
+                #
+                # Handles:
+                #   GRADE DIM LPN PCS ...
+                #   GRADE DIM PCS LPN ...
+                # ==================================================
+
+                # Find PIECES near/after DIM
                 pieces_idx = None
+
                 for j in range(dim_idx + 1, min(dim_idx + 9, len(tokens))):
                     if is_pieces(tokens[j]):
                         pieces_idx = j
@@ -304,22 +453,26 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
                 if pieces_idx is None:
                     continue
 
-                pieces = int(tokens[pieces_idx])
+                pieces = int(clean_token(tokens[pieces_idx]))
 
+                # Find best PACKAGEID token near PIECES
                 candidates = []
+
                 for off in range(-6, 7):
                     if off == 0:
                         continue
 
                     k = pieces_idx + off
+
                     if 0 <= k < len(tokens):
-                        tok = tokens[k]
+                        tok = clean_token(tokens[k])
                         score = id_pattern_score(tok)
 
                         if score <= 0:
                             continue
 
                         bonus = 0
+
                         if package_id_whitelist is not None and tok in package_id_whitelist:
                             bonus = 100
 
@@ -349,8 +502,6 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
                 )
 
     return pd.DataFrame(rows)
-
-
 # ==================================================
 # Full Process - Original
 # ==================================================
@@ -456,7 +607,7 @@ def process_dabg(container_file, sku_file, pdf_files):
     if pdf_items.empty:
         raise ValueError("No line-items were parsed from the PDFs.")
 
-    pdf_items["PACKAGEID"] = pdf_items["PACKAGEID"].apply(norm_id)
+    pdf_items["PACKAGEID"] = pdf_items["PACKAGEID"].astype(str).str.strip()
     pdf_items["PCS"] = pdf_items["PCS"].apply(norm_int_str)
     pdf_items["THICKNESS"] = pdf_items["THICKNESS"].apply(norm_int_str)
     pdf_items["WIDTH"] = pdf_items["WIDTH"].apply(norm_int_str)
