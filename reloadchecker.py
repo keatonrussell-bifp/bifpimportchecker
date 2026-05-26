@@ -412,20 +412,21 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
     """
     Parses warehouse receipt PDFs into LPN rows for DABG.
 
+    Correct PDF layout:
+      ITEM / DIMENSION / LPN / PIECES / TOTAL LBS
+
     DABG key ignores grade:
       DABG_MATCH_KEY = THICKNESS|WIDTH|LENGTH|PCS
 
     Full consumed key:
       DABG_MATCH_KEY_LPN = THICKNESS|WIDTH|LENGTH|PCS|LPN
 
-    This version handles both:
-      APG 1x4x144 (BUN: 208 240 0.0000
+    Example PDF row:
+      APG 1x6x144 ... 213 160 0.0000
 
-    and PyPDF stacked extraction:
-      APG 1x4x144 (BUN:
-      208
-      240
-      0.0000
+    Correct output:
+      DABG_MATCH_KEY     = 1|6|144|160
+      DABG_MATCH_KEY_LPN = 1|6|144|160|213
     """
     rows = []
     raw_lines_rows = []
@@ -470,31 +471,29 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
             return True
         return False
 
-    def token_is_candidate_lpn(tok: str) -> bool:
-        tok = str(tok).strip()
-        if not tok:
-            return False
-        if tok.upper() in header_words:
-            return False
-        if re.fullmatch(r"\d+(?:\.\d+)?", tok):
-            return True
-        if re.fullmatch(r"[A-Za-z0-9\-]+", tok):
-            return True
-        return False
-
-    def token_is_piece(tok: str) -> bool:
-        tok = str(tok).strip()
-        if not re.fullmatch(r"\d+", tok):
-            return False
-        n = int(tok)
-        return 1 <= n <= 10000
-
     def token_is_total_lbs(tok: str) -> bool:
         tok = str(tok).strip()
         return bool(re.fullmatch(r"\d+\.\d+", tok))
 
     def numeric_or_alnum_tokens(text: str):
         return re.findall(r"[A-Za-z0-9\-]+|\d+\.\d+", text)
+
+    def is_valid_lpn(tok: str) -> bool:
+        tok = str(tok).strip()
+        if not tok:
+            return False
+        if tok.upper() in header_words:
+            return False
+        if token_is_total_lbs(tok):
+            return False
+        return bool(re.fullmatch(r"[A-Za-z0-9\-]+", tok))
+
+    def is_valid_pcs(tok: str) -> bool:
+        tok = str(tok).strip()
+        if not re.fullmatch(r"\d+", tok):
+            return False
+        n = int(tok)
+        return 1 <= n <= 10000
 
     def add_row(pdf_name, page_num, line_num, grade_raw, thk, wid, leng, lpn, pcs, container, order, source_method):
         thk = norm_int_str(thk)
@@ -504,6 +503,9 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
         lpn = norm_id(lpn)
 
         if not thk or not wid or not leng or not pcs or not lpn:
+            return
+
+        if not is_valid_pcs(pcs):
             return
 
         key = make_dabg_dim_pcs_key(thk, wid, leng, pcs)
@@ -531,6 +533,7 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
         reader = PdfReader(BytesIO(pdf.getvalue()))
         pages_text = [(p.extract_text() or "") for p in reader.pages]
         full_text = "\n".join(pages_text)
+
         container, order = extract_container_and_order(full_text, pdf.name)
 
         for page_num, text in enumerate(pages_text, start=1):
@@ -548,6 +551,7 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
                 )
 
             i = 0
+
             while i < len(lines):
                 line = lines[i]
 
@@ -568,75 +572,30 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
 
                 after = line[m.end():].strip()
                 after = after.replace("(", " ").replace(")", " ").replace(":", " ")
+
                 toks = numeric_or_alnum_tokens(after)
 
-                # Remove obvious label tokens.
                 toks = [
                     t for t in toks
                     if t.upper() not in {"BUN", "LPN", "PIECES", "TOTAL", "LBS"}
                 ]
 
-                lpn = ""
-                pcs = ""
+                toks = [
+                    t for t in toks
+                    if not token_is_total_lbs(t)
+                ]
 
-                # Case 1: same line has LPN and PCS.
-                # Example: APG 1x4x144 (BUN: 208 240 0.0000
+                # Same-line case:
+                # APG 1x6x144 (BUN: 213 160 0.0000
+                #
+                # Correct:
+                # LPN = 213
+                # PCS = 160
                 if len(toks) >= 2:
-                    filtered = [t for t in toks if not token_is_total_lbs(t)]
+                    lpn = toks[0]
+                    pcs = toks[1]
 
-                    if len(filtered) >= 2:
-                        lpn = filtered[0]
-                        pcs = filtered[1]
-
-                if lpn and pcs and token_is_piece(str(pcs)):
-                    add_row(
-                        pdf.name,
-                        page_num,
-                        i + 1,
-                        grade_raw,
-                        thk,
-                        wid,
-                        leng,
-                        lpn,
-                        pcs,
-                        container,
-                        order,
-                        "same-line",
-                    )
-                    i += 1
-                    continue
-
-                # Case 2: stacked extraction.
-                # Item line followed by separate LPN / PCS / total lbs lines.
-                stacked_tokens = []
-
-                j = i + 1
-                while j < len(lines) and j <= i + 8:
-                    nxt = lines[j]
-
-                    # Stop if the next item starts.
-                    if item_pat.search(nxt):
-                        break
-
-                    if not looks_like_header(nxt):
-                        for tok in numeric_or_alnum_tokens(nxt):
-                            if tok.upper() in {"BUN", "LPN", "PIECES", "TOTAL", "LBS"}:
-                                continue
-                            if token_is_total_lbs(tok):
-                                continue
-                            if token_is_candidate_lpn(tok):
-                                stacked_tokens.append(tok)
-
-                    if len(stacked_tokens) >= 2:
-                        break
-
-                    j += 1
-
-                if len(stacked_tokens) >= 2:
-                    lpn = stacked_tokens[0]
-                    pcs = stacked_tokens[1]
-
-                    if token_is_piece(str(pcs)):
+                    if is_valid_lpn(lpn) and is_valid_pcs(pcs):
                         add_row(
                             pdf.name,
                             page_num,
@@ -649,7 +608,58 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
                             pcs,
                             container,
                             order,
-                            "stacked-lines",
+                            "same-line-lpn-pcs",
+                        )
+
+                        i += 1
+                        continue
+
+                # Stacked extraction case:
+                # APG 1x6x144 (BUN:
+                # 213
+                # 160
+                # 0.0000
+                stacked_tokens = []
+
+                j = i + 1
+
+                while j < len(lines) and j <= i + 8:
+                    nxt = lines[j]
+
+                    if item_pat.search(nxt):
+                        break
+
+                    if not looks_like_header(nxt):
+                        for tok in numeric_or_alnum_tokens(nxt):
+                            if tok.upper() in {"BUN", "LPN", "PIECES", "TOTAL", "LBS"}:
+                                continue
+                            if token_is_total_lbs(tok):
+                                continue
+                            stacked_tokens.append(tok)
+
+                    if len(stacked_tokens) >= 2:
+                        break
+
+                    j += 1
+
+                if len(stacked_tokens) >= 2:
+                    lpn = stacked_tokens[0]
+                    pcs = stacked_tokens[1]
+
+                    if is_valid_lpn(lpn) and is_valid_pcs(pcs):
+                        add_row(
+                            pdf.name,
+                            page_num,
+                            i + 1,
+                            grade_raw,
+                            thk,
+                            wid,
+                            leng,
+                            lpn,
+                            pcs,
+                            container,
+                            order,
+                            "stacked-lines-lpn-pcs",
                         )
 
                         i = j + 1
@@ -667,6 +677,7 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
         ).reset_index(drop=True)
 
     return pdf_df, raw_lines_df
+ 
 
 
 # ==================================================
