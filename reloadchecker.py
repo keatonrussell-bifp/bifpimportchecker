@@ -581,6 +581,11 @@ def process_dabg(container_file, sku_file, pdf_files):
       - Consumes one PDF LPN per matched Excel row
       - Keeps unmatched Excel rows
       - Adds extra rows for unused PDF LPNs
+
+    Visible MATCH KEY and DABG MATCH KEY are intentionally the same format:
+      mapped description | thickness | width | length | pcs
+
+    SKU matching uses an internal SKU MATCH KEY without PCS.
     """
     raw_df = pd.read_excel(container_file, header=None, dtype=str)
     df = normalize_headers(raw_df).fillna("")
@@ -602,8 +607,7 @@ def process_dabg(container_file, sku_file, pdf_files):
 
     df["MAPPED DESCRIPTION"] = df["GRADE"].apply(map_description)
 
-    # Excel/container-side DABG key.
-    # PCS is intentionally included.
+    # DABG match key includes PCS.
     df["DABG MATCH KEY"] = (
         df["MAPPED DESCRIPTION"].astype(str).str.strip()
         + "|"
@@ -614,6 +618,20 @@ def process_dabg(container_file, sku_file, pdf_files):
         + df["LENGTH"].astype(str).str.strip()
         + "|"
         + df["PCS"].astype(str).str.strip()
+    )
+
+    # Visible MATCH KEY should match DABG MATCH KEY exactly.
+    df["MATCH KEY"] = df["DABG MATCH KEY"]
+
+    # Internal SKU key does NOT include PCS.
+    df["SKU MATCH KEY"] = (
+        df["MAPPED DESCRIPTION"].astype(str).str.strip()
+        + "|"
+        + df["THICKNESS"].astype(str).str.strip()
+        + "|"
+        + df["WIDTH"].astype(str).str.strip()
+        + "|"
+        + df["LENGTH"].astype(str).str.strip()
     )
 
     # -----------------------------
@@ -637,8 +655,7 @@ def process_dabg(container_file, sku_file, pdf_files):
 
     pdf_items["MAPPED DESCRIPTION"] = pdf_items["GRADE"].apply(map_description)
 
-    # PDF-side DABG key.
-    # PDF PIECES / PCS is intentionally included.
+    # PDF DABG key includes PDF PCS.
     pdf_items["PDF DABG MATCH KEY"] = (
         pdf_items["MAPPED DESCRIPTION"].astype(str).str.strip()
         + "|"
@@ -649,6 +666,17 @@ def process_dabg(container_file, sku_file, pdf_files):
         + pdf_items["LENGTH"].astype(str).str.strip()
         + "|"
         + pdf_items["PCS"].astype(str).str.strip()
+    )
+
+    # Internal PDF SKU key does NOT include PCS.
+    pdf_items["SKU MATCH KEY"] = (
+        pdf_items["MAPPED DESCRIPTION"].astype(str).str.strip()
+        + "|"
+        + pdf_items["THICKNESS"].astype(str).str.strip()
+        + "|"
+        + pdf_items["WIDTH"].astype(str).str.strip()
+        + "|"
+        + pdf_items["LENGTH"].astype(str).str.strip()
     )
 
     # -----------------------------
@@ -727,7 +755,7 @@ def process_dabg(container_file, sku_file, pdf_files):
     df["PDF PCS"] = assigned_pdf_pcs
     df["PDF DABG MATCH KEY"] = assigned_pdf_keys
 
-    # For DABG Sales Assist, Identifier should use the consumed PDF LPN.
+    # DABG Sales Assist Identifier should use the consumed PDF LPN.
     df["DABG IDENTIFIER"] = df["ASSIGNED PDF LPN"].astype(str).str.strip()
 
     # -----------------------------
@@ -744,6 +772,7 @@ def process_dabg(container_file, sku_file, pdf_files):
             unused_row["DABG MATCHED BY"] = "ITEM/DIMENSION/PCS"
 
             unused_row["DABG MATCH KEY"] = ""
+            unused_row["MATCH KEY"] = pdf_row.get("PDF DABG MATCH KEY", "")
             unused_row["PDF DABG MATCH KEY"] = pdf_row.get("PDF DABG MATCH KEY", "")
 
             unused_row["ASSIGNED PDF LPN"] = pdf_row.get("PACKAGEID", "")
@@ -768,6 +797,7 @@ def process_dabg(container_file, sku_file, pdf_files):
             unused_row["ORDERNUMBER"] = pdf_row.get("ORDERNUMBER", "")
             unused_row["QTY"] = pdf_row.get("QTY", "")
             unused_row["MAPPED DESCRIPTION"] = pdf_row.get("MAPPED DESCRIPTION", "")
+            unused_row["SKU MATCH KEY"] = pdf_row.get("SKU MATCH KEY", "")
 
             unused_pdf_rows.append(unused_row)
 
@@ -779,21 +809,22 @@ def process_dabg(container_file, sku_file, pdf_files):
     # -----------------------------
     sku_df = load_sku_lookup(sku_file)
 
-    # SKU match key intentionally does NOT include PCS.
-    # This is separate from the DABG match key.
-    df["MATCH KEY"] = (
-        df["MAPPED DESCRIPTION"].astype(str).str.strip()
-        + "|"
-        + df["THICKNESS"].astype(str).str.strip()
-        + "|"
-        + df["WIDTH"].astype(str).str.strip()
-        + "|"
-        + df["LENGTH"].astype(str).str.strip()
-    )
+    # Rename SKU lookup's MATCH KEY so we don't overwrite visible MATCH KEY.
+    sku_match_df = sku_df[["SKU", "MATCH KEY"]].rename(columns={"MATCH KEY": "SKU MATCH KEY"})
 
-    df = df.merge(sku_df[["SKU", "MATCH KEY"]], how="left", on="MATCH KEY")
+    df = df.merge(sku_match_df, how="left", on="SKU MATCH KEY")
     df["MATCH"] = df["SKU"].apply(lambda x: "YES" if sku_is_valid(x) else "NO")
     df = df.fillna("")
+
+    # Force visible MATCH KEY and DABG MATCH KEY to be the same format.
+    # For Excel/container rows, MATCH KEY = DABG MATCH KEY.
+    # For unused PDF rows, MATCH KEY = PDF DABG MATCH KEY.
+    df["MATCH KEY"] = df.apply(
+        lambda r: r.get("PDF DABG MATCH KEY", "")
+        if str(r.get("DABG ROW TYPE", "")).upper() == "UNUSED PDF LPN"
+        else r.get("DABG MATCH KEY", ""),
+        axis=1,
+    )
 
     dabg_cols = [
         "DABG ROW TYPE",
@@ -801,6 +832,7 @@ def process_dabg(container_file, sku_file, pdf_files):
         "ASSIGNED PDF LPN",
         "DABG MATCH",
         "DABG MATCHED BY",
+        "MATCH KEY",
         "DABG MATCH KEY",
         "PDF DABG MATCH KEY",
         "ASSIGNED PDF FILE",
