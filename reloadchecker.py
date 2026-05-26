@@ -879,18 +879,22 @@ def generate_dabg_sales_assist(df: pd.DataFrame) -> pd.DataFrame:
     """
     DABG Sales Assist export.
 
-    Correct output rules:
-      - Pieces comes from the container list PCS column.
-      - Identifier comes from the container list PACKAGEID column.
-      - Assigned PDF LPN is included only as an audit/reference column.
-      - UNUSED EXCEL ROW and UNUSED PDF LPN rows are excluded.
+    Same column layout as the original Sales Assist export.
+
+    Difference from original:
+      - Identifier uses the consumed/assigned PDF LPN.
+      - Pieces still comes from the container list PCS.
+      - Quantity still comes from the container list row.
+      - Only MATCHED rows are exported.
     """
     out_df = df.copy()
 
+    # Only export matched DABG rows.
+    # UNUSED EXCEL ROW and UNUSED PDF LPN rows stay in the DABG audit file only.
     if "DABG ROW TYPE" in out_df.columns:
         out_df = out_df[out_df["DABG ROW TYPE"].astype(str).str.upper() == "MATCHED"].copy()
 
-    # OrderNumber
+    # OrderNumber - same as original Sales Assist generator
     order_raw = col_or_default(out_df, "ORDERNUMBER", "").astype(str).str.split("-").str[0].str.strip()
 
     if series_digits_only(order_raw):
@@ -898,20 +902,18 @@ def generate_dabg_sales_assist(df: pd.DataFrame) -> pd.DataFrame:
     else:
         order_out = order_raw
 
-    # Correct:
-    # Identifier / PACKAGEID in generated Sales Assist comes from container list PACKAGEID.
-    ident_raw = col_or_default(out_df, "PACKAGEID", "").astype(str).str.strip()
+    # DABG Identifier:
+    # Use the consumed/assigned PDF LPN.
+    ident_raw = col_or_default(out_df, "ASSIGNED PDF LPN", "").astype(str).str.strip()
 
-    if series_digits_only(ident_raw):
-        ident_out = pd.to_numeric(ident_raw, errors="coerce").fillna(0).astype(int)
-    else:
-        ident_out = ident_raw
+    # Keep as text so leading zeroes are not lost if any PDF LPN has them.
+    ident_out = ident_raw
 
-    # Correct:
-    # Pieces comes from container list PCS.
+    # Pieces comes from the container list PCS column
     pcs = pd.to_numeric(col_or_default(out_df, "PCS", 0), errors="coerce").fillna(0).astype(int)
 
-    # Quantity BF uses container row data.
+    # Quantity BF:
+    # Same logic as original. Use QTY if present, otherwise calculate from container row.
     if "QTY" in out_df.columns:
         qty = pd.to_numeric(out_df["QTY"], errors="coerce").fillna(0).astype(int)
     else:
@@ -921,6 +923,7 @@ def generate_dabg_sales_assist(df: pd.DataFrame) -> pd.DataFrame:
 
         qty = (pcs * (thk * wid * leng) / 144.0).round().fillna(0).astype(int)
 
+    # Same exact columns as original Sales Assist export
     return pd.DataFrame(
         {
             "SKU": col_or_default(out_df, "SKU", ""),
@@ -934,16 +937,8 @@ def generate_dabg_sales_assist(df: pd.DataFrame) -> pd.DataFrame:
             "ReloadReference": "",
             "Identifier": ident_out,
             "ProFormaPrice": 0,
-
-            # Audit/reference only
-            "ContainerList_PACKAGEID": col_or_default(out_df, "PACKAGEID", ""),
-            "Assigned_PDF_LPN": col_or_default(out_df, "ASSIGNED PDF LPN", ""),
-            "PDF_PCS": col_or_default(out_df, "PDF PCS", ""),
-            "DABG_MATCH": col_or_default(out_df, "DABG MATCH", ""),
-            "Assigned_PDF_Container": col_or_default(out_df, "ASSIGNED PDF CONTAINER", ""),
         }
     )
-
 
 # ==================================================
 # UI Styling
