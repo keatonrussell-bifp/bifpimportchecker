@@ -404,7 +404,6 @@ def process_all(container_file, sku_file, pdf_files):
         + df["THICKNESS"].astype(str) + "|"
         + df["WIDTH"].astype(str) + "|"
         + df["LENGTH"].astype(str)
-        + df["PCS"].astype(str)
     )
 
     df = df.merge(sku_df[["SKU", "MATCH KEY"]], how="left", on="MATCH KEY")
