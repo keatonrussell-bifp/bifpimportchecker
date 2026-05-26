@@ -438,18 +438,21 @@ def parse_dabg_pdf_lpns_by_item_dimension_pcs(pdf_files) -> pd.DataFrame:
     DABG-only PDF parser.
 
     Correct PDF row meaning:
-      APG 1x4x144 (BUN: 114 240 0.0000
+
+        APG 1x8x144 (BUN: 208 120 0.0000
 
     Means:
-      GRADE = APG
-      THICKNESS = 1
-      WIDTH = 4
-      LENGTH = 144
-      PACKAGEID / LPN = 114
-      PCS = 240
+        GRADE / ITEM = APG
+        THICKNESS = 1
+        WIDTH = 8
+        LENGTH = 144
+        LPN = 208
+        PIECES = 120
 
-    Combined extraction fallback:
-      240114 means PCS 240 and LPN 114.
+    DABG matches Excel/container rows to PDF rows by:
+        mapped grade/item + thickness + width + length + pieces
+
+    The PDF LPN is consumed after the match.
     """
     rows = []
     dim_pat = re.compile(r"\b(\d+)\s*[Xx]\s*(\d+)\s*[Xx]\s*(\d+)\b")
@@ -469,14 +472,16 @@ def parse_dabg_pdf_lpns_by_item_dimension_pcs(pdf_files) -> pd.DataFrame:
         wid = dim_match.group(2)
         leng = dim_match.group(3)
 
+        # Item/grade is everything before the dimension.
         grade = line[:dim_match.start()].strip()
 
         if not grade:
             return None
 
+        # Everything after dimension contains BUN text, LPN, PIECES, TOTAL LBS.
         after_dim = line[dim_match.end():].strip()
 
-        # BUN is not part of matching.
+        # Remove BUN label. It is not part of the match.
         after_dim = re.sub(r"\(?\s*BUN\s*:?", " ", after_dim, flags=re.IGNORECASE)
         after_dim = after_dim.replace(")", " ")
 
@@ -489,36 +494,38 @@ def parse_dabg_pdf_lpns_by_item_dimension_pcs(pdf_files) -> pd.DataFrame:
             if not raw:
                 continue
 
-            # Ignore total lbs decimals like 0.0000.
+            # Ignore TOTAL LBS like 0.0000
             if re.fullmatch(r"\d+\.\d+", raw):
                 continue
 
             if re.fullmatch(r"\d+", raw):
                 nums.append(raw)
 
-        # Correct normal layout:
-        #   LPN PCS TOTAL_LBS
+        # Correct normal PDF layout:
+        #   LPN PIECES TOTAL_LBS
+        #
         # Example:
-        #   114 240 0.0000
+        #   208 120 0.0000
         #
         # Therefore:
-        #   LPN = first integer
-        #   PCS = second integer
+        #   LPN = nums[0]
+        #   PIECES = nums[1]
         if len(nums) >= 2:
             lpn = nums[0]
-            pcs = nums[1]
-            return grade, thk, wid, leng, lpn, pcs
+            pieces = nums[1]
+            return grade, thk, wid, leng, lpn, pieces
 
-        # Combined fallback:
-        #   240114 = PCS 240 + LPN 114
-        # LPN is last 3 digits.
+        # Fallback only if PyPDF2 combines the values.
+        # If combined as 120208, interpret as:
+        #   PIECES = 120
+        #   LPN = 208
         if len(nums) == 1 and re.fullmatch(r"\d{4,}", nums[0]):
             combined = nums[0]
-            pcs = combined[:-3]
+            pieces = combined[:-3]
             lpn = combined[-3:]
 
-            if pcs and lpn:
-                return grade, thk, wid, leng, lpn, pcs
+            if pieces and lpn:
+                return grade, thk, wid, leng, lpn, pieces
 
         return None
 
@@ -536,13 +543,13 @@ def parse_dabg_pdf_lpns_by_item_dimension_pcs(pdf_files) -> pd.DataFrame:
                 if parsed is None:
                     continue
 
-                grade, thk, wid, leng, lpn, pcs = parsed
+                grade, thk, wid, leng, lpn, pieces = parsed
 
                 try:
                     thk_int = int(thk)
                     wid_int = int(wid)
                     leng_int = int(leng)
-                    pieces_int = int(pcs)
+                    pieces_int = int(pieces)
                 except Exception:
                     continue
 
@@ -553,8 +560,8 @@ def parse_dabg_pdf_lpns_by_item_dimension_pcs(pdf_files) -> pd.DataFrame:
 
                 rows.append(
                     {
-                        "PACKAGEID": str(lpn).strip(),
-                        "PCS": str(pieces_int),
+                        "PACKAGEID": str(lpn).strip(),       # PDF LPN
+                        "PCS": str(pieces_int),              # PDF PIECES
                         "QTY": qty,
                         "GRADE": str(grade).strip(),
                         "THICKNESS": str(thk_int),
@@ -703,12 +710,9 @@ def process_dabg(container_file, sku_file, pdf_files):
 
     # Correct identifier:
     # DABG IDENTIFIER should always be the assigned PDF LPN when matched.
-    df["DABG IDENTIFIER"] = df.apply(
-        lambda r: str(r.get("ASSIGNED PDF LPN", "")).strip()
-        if str(r.get("ASSIGNED PDF LPN", "")).strip()
-        else str(r.get("PACKAGEID", "")).strip(),
-        axis=1,
-    )
+    # Sales Assist Identifier should stay as the container list PACKAGEID.
+    # The assigned PDF LPN is audit-only.
+    df["DABG IDENTIFIER"] = df["PACKAGEID"].astype(str).str.strip()
 
     # Add rows for unused PDF LPNs.
     unused_pdf_rows = []
@@ -736,7 +740,7 @@ def process_dabg(container_file, sku_file, pdf_files):
             unused_row["PDF LENGTH"] = pdf_row.get("LENGTH", "")
             unused_row["PDF PCS"] = pdf_row.get("PCS", "")
 
-            unused_row["DABG IDENTIFIER"] = pdf_row.get("PACKAGEID", "")
+            unused_row["DABG IDENTIFIER"] = ""
 
             # Make unused PDF rows readable in common columns too.
             unused_row["GRADE"] = pdf_row.get("GRADE", "")
@@ -872,12 +876,21 @@ def generate_sales_assist(df: pd.DataFrame) -> pd.DataFrame:
 # Sales Assist Generator - DABG
 # ==================================================
 def generate_dabg_sales_assist(df: pd.DataFrame) -> pd.DataFrame:
-    # Only export matched rows to Sales Assist.
+    """
+    DABG Sales Assist export.
+
+    Correct output rules:
+      - Pieces comes from the container list PCS column.
+      - Identifier comes from the container list PACKAGEID column.
+      - Assigned PDF LPN is included only as an audit/reference column.
+      - UNUSED EXCEL ROW and UNUSED PDF LPN rows are excluded.
+    """
     out_df = df.copy()
 
     if "DABG ROW TYPE" in out_df.columns:
         out_df = out_df[out_df["DABG ROW TYPE"].astype(str).str.upper() == "MATCHED"].copy()
 
+    # OrderNumber
     order_raw = col_or_default(out_df, "ORDERNUMBER", "").astype(str).str.split("-").str[0].str.strip()
 
     if series_digits_only(order_raw):
@@ -886,11 +899,19 @@ def generate_dabg_sales_assist(df: pd.DataFrame) -> pd.DataFrame:
         order_out = order_raw
 
     # Correct:
-    # Identifier must be assigned PDF LPN, not PCS.
-    ident_out = col_or_default(out_df, "DABG IDENTIFIER", "").astype(str).str.strip()
+    # Identifier / PACKAGEID in generated Sales Assist comes from container list PACKAGEID.
+    ident_raw = col_or_default(out_df, "PACKAGEID", "").astype(str).str.strip()
 
+    if series_digits_only(ident_raw):
+        ident_out = pd.to_numeric(ident_raw, errors="coerce").fillna(0).astype(int)
+    else:
+        ident_out = ident_raw
+
+    # Correct:
+    # Pieces comes from container list PCS.
     pcs = pd.to_numeric(col_or_default(out_df, "PCS", 0), errors="coerce").fillna(0).astype(int)
 
+    # Quantity BF uses container row data.
     if "QTY" in out_df.columns:
         qty = pd.to_numeric(out_df["QTY"], errors="coerce").fillna(0).astype(int)
     else:
@@ -913,8 +934,11 @@ def generate_dabg_sales_assist(df: pd.DataFrame) -> pd.DataFrame:
             "ReloadReference": "",
             "Identifier": ident_out,
             "ProFormaPrice": 0,
-            "ContainerList_PACKAGEID": col_or_default(out_df, "CONTAINER PACKAGEID", ""),
+
+            # Audit/reference only
+            "ContainerList_PACKAGEID": col_or_default(out_df, "PACKAGEID", ""),
             "Assigned_PDF_LPN": col_or_default(out_df, "ASSIGNED PDF LPN", ""),
+            "PDF_PCS": col_or_default(out_df, "PDF PCS", ""),
             "DABG_MATCH": col_or_default(out_df, "DABG MATCH", ""),
             "Assigned_PDF_Container": col_or_default(out_df, "ASSIGNED PDF CONTAINER", ""),
         }
