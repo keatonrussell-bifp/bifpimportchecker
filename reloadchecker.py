@@ -27,6 +27,9 @@ if "dabg_pdf_df" not in st.session_state:
 if "dabg_sa_df" not in st.session_state:
     st.session_state.dabg_sa_df = None
 
+if "dabg_raw_pdf_lines_df" not in st.session_state:
+    st.session_state.dabg_raw_pdf_lines_df = None
+
 
 # ==================================================
 # Helpers
@@ -109,6 +112,10 @@ def col_or_default(df: pd.DataFrame, col: str, default):
         return df[col]
 
     return pd.Series([default] * len(df), index=df.index)
+
+
+def clean_pdf_line(line: str) -> str:
+    return " ".join(str(line).replace("\xa0", " ").strip().split())
 
 
 # ==================================================
@@ -376,27 +383,55 @@ def make_dabg_dim_pcs_key(thickness, width, length, pcs) -> str:
     )
 
 
-def parse_dabg_pdfs_lpn_rows(pdf_files) -> pd.DataFrame:
+def extract_raw_pdf_lines(pdf_files) -> pd.DataFrame:
+    rows = []
+
+    for pdf in pdf_files:
+        reader = PdfReader(BytesIO(pdf.getvalue()))
+
+        for page_num, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+
+            for line_num, line in enumerate(text.splitlines(), start=1):
+                line_clean = clean_pdf_line(line)
+
+                if line_clean:
+                    rows.append(
+                        {
+                            "PDF_FILE": pdf.name,
+                            "PDF_PAGE": page_num,
+                            "PDF_LINE": line_num,
+                            "TEXT": line_clean,
+                        }
+                    )
+
+    return pd.DataFrame(rows)
+
+
+def parse_dabg_pdfs_lpn_rows(pdf_files):
     """
     Parses warehouse receipt PDFs into LPN rows for DABG.
 
-    New DABG key ignores grade:
+    DABG key ignores grade:
       DABG_MATCH_KEY = THICKNESS|WIDTH|LENGTH|PCS
-
-    Example:
-      1|4|144|240
 
     Full consumed key:
       DABG_MATCH_KEY_LPN = THICKNESS|WIDTH|LENGTH|PCS|LPN
 
-    Example:
-      1|4|144|240|208
+    This version handles both:
+      APG 1x4x144 (BUN: 208 240 0.0000
+
+    and PyPDF stacked extraction:
+      APG 1x4x144 (BUN:
+      208
+      240
+      0.0000
     """
     rows = []
+    raw_lines_rows = []
 
-    receipt_line_pat = re.compile(
+    item_pat = re.compile(
         r"""
-        ^\s*
         (?P<grade>[A-Za-z0-9#/\-\s]+?)
         \s+
         (?P<thickness>\d+)
@@ -404,68 +439,234 @@ def parse_dabg_pdfs_lpn_rows(pdf_files) -> pd.DataFrame:
         (?P<width>\d+)
         \s*[xX]\s*
         (?P<length>\d+)
-        .*?
-        \s+
-        (?P<lpn>[A-Za-z0-9\-]+)
-        \s+
-        (?P<pieces>\d+)
-        \s+
-        (?P<total_lbs>\d+(?:\.\d+)?)
-        \s*$
         """,
         re.VERBOSE,
     )
+
+    header_words = {
+        "ITEM", "LOT", "LOT CODE", "SUBLOT", "SUBLOT CODE",
+        "LPN", "PIECES", "TOTAL", "TOTAL LBS", "WAREHOUSE",
+        "RECEIPT", "PAGE", "TRANSACTION", "CONTAINER", "CARRIER",
+        "RECVD", "FROM", "FOR", "ACCOUNT", "SPECIAL", "INSTRUCTIONS",
+    }
+
+    def looks_like_header(line: str) -> bool:
+        up = line.upper().strip()
+        if up in header_words:
+            return True
+        if "ITEM" in up and "LPN" in up and "PIECES" in up:
+            return True
+        if "WAREHOUSE RECEIPT" in up:
+            return True
+        if up.startswith("PAGE "):
+            return True
+        if up.startswith("TRANSACTION"):
+            return True
+        if up.startswith("RECEIPT"):
+            return True
+        if up.startswith("CONTAINER"):
+            return True
+        if up.startswith("P.O."):
+            return True
+        return False
+
+    def token_is_candidate_lpn(tok: str) -> bool:
+        tok = str(tok).strip()
+        if not tok:
+            return False
+        if tok.upper() in header_words:
+            return False
+        if re.fullmatch(r"\d+(?:\.\d+)?", tok):
+            return True
+        if re.fullmatch(r"[A-Za-z0-9\-]+", tok):
+            return True
+        return False
+
+    def token_is_piece(tok: str) -> bool:
+        tok = str(tok).strip()
+        if not re.fullmatch(r"\d+", tok):
+            return False
+        n = int(tok)
+        return 1 <= n <= 10000
+
+    def token_is_total_lbs(tok: str) -> bool:
+        tok = str(tok).strip()
+        return bool(re.fullmatch(r"\d+\.\d+", tok))
+
+    def numeric_or_alnum_tokens(text: str):
+        return re.findall(r"[A-Za-z0-9\-]+|\d+\.\d+", text)
+
+    def add_row(pdf_name, page_num, line_num, grade_raw, thk, wid, leng, lpn, pcs, container, order, source_method):
+        thk = norm_int_str(thk)
+        wid = norm_int_str(wid)
+        leng = norm_int_str(leng)
+        pcs = norm_int_str(pcs)
+        lpn = norm_id(lpn)
+
+        if not thk or not wid or not leng or not pcs or not lpn:
+            return
+
+        key = make_dabg_dim_pcs_key(thk, wid, leng, pcs)
+
+        rows.append(
+            {
+                "PDF_FILE": pdf_name,
+                "PDF_PAGE": page_num,
+                "PDF_LINE": line_num,
+                "PDF_GRADE_RAW": grade_raw,
+                "THICKNESS": thk,
+                "WIDTH": wid,
+                "LENGTH": leng,
+                "PCS": pcs,
+                "LPN": lpn,
+                "DABG_MATCH_KEY": key,
+                "DABG_MATCH_KEY_LPN": f"{key}|{lpn}",
+                "CONTAINER": container,
+                "ORDERNUMBER": order,
+                "SOURCE_METHOD": source_method,
+            }
+        )
 
     for pdf in pdf_files:
         reader = PdfReader(BytesIO(pdf.getvalue()))
         pages_text = [(p.extract_text() or "") for p in reader.pages]
         full_text = "\n".join(pages_text)
-
         container, order = extract_container_and_order(full_text, pdf.name)
 
         for page_num, text in enumerate(pages_text, start=1):
-            for line_num, line in enumerate(text.splitlines(), start=1):
-                line_clean = " ".join(line.strip().split())
+            lines = [clean_pdf_line(x) for x in text.splitlines()]
+            lines = [x for x in lines if x]
 
-                if not line_clean:
-                    continue
-
-                m = receipt_line_pat.match(line_clean)
-
-                if not m:
-                    continue
-
-                grade_raw = m.group("grade").strip()
-                thk = norm_int_str(m.group("thickness"))
-                wid = norm_int_str(m.group("width"))
-                leng = norm_int_str(m.group("length"))
-                pcs = norm_int_str(m.group("pieces"))
-                lpn = norm_id(m.group("lpn"))
-
-                if not lpn or not pcs:
-                    continue
-
-                match_key = make_dabg_dim_pcs_key(thk, wid, leng, pcs)
-
-                rows.append(
+            for line_num, line in enumerate(lines, start=1):
+                raw_lines_rows.append(
                     {
                         "PDF_FILE": pdf.name,
                         "PDF_PAGE": page_num,
                         "PDF_LINE": line_num,
-                        "PDF_GRADE_RAW": grade_raw,
-                        "THICKNESS": thk,
-                        "WIDTH": wid,
-                        "LENGTH": leng,
-                        "PCS": pcs,
-                        "LPN": lpn,
-                        "DABG_MATCH_KEY": match_key,
-                        "DABG_MATCH_KEY_LPN": f"{match_key}|{lpn}",
-                        "CONTAINER": container,
-                        "ORDERNUMBER": order,
+                        "TEXT": line,
                     }
                 )
 
-    return pd.DataFrame(rows)
+            i = 0
+            while i < len(lines):
+                line = lines[i]
+
+                if looks_like_header(line):
+                    i += 1
+                    continue
+
+                m = item_pat.search(line)
+
+                if not m:
+                    i += 1
+                    continue
+
+                grade_raw = m.group("grade").strip()
+                thk = m.group("thickness")
+                wid = m.group("width")
+                leng = m.group("length")
+
+                after = line[m.end():].strip()
+                after = after.replace("(", " ").replace(")", " ").replace(":", " ")
+                toks = numeric_or_alnum_tokens(after)
+
+                # Remove obvious label tokens.
+                toks = [
+                    t for t in toks
+                    if t.upper() not in {"BUN", "LPN", "PIECES", "TOTAL", "LBS"}
+                ]
+
+                lpn = ""
+                pcs = ""
+
+                # Case 1: same line has LPN and PCS.
+                # Example: APG 1x4x144 (BUN: 208 240 0.0000
+                if len(toks) >= 2:
+                    filtered = [t for t in toks if not token_is_total_lbs(t)]
+
+                    if len(filtered) >= 2:
+                        lpn = filtered[0]
+                        pcs = filtered[1]
+
+                if lpn and pcs and token_is_piece(str(pcs)):
+                    add_row(
+                        pdf.name,
+                        page_num,
+                        i + 1,
+                        grade_raw,
+                        thk,
+                        wid,
+                        leng,
+                        lpn,
+                        pcs,
+                        container,
+                        order,
+                        "same-line",
+                    )
+                    i += 1
+                    continue
+
+                # Case 2: stacked extraction.
+                # Item line followed by separate LPN / PCS / total lbs lines.
+                stacked_tokens = []
+
+                j = i + 1
+                while j < len(lines) and j <= i + 8:
+                    nxt = lines[j]
+
+                    # Stop if the next item starts.
+                    if item_pat.search(nxt):
+                        break
+
+                    if not looks_like_header(nxt):
+                        for tok in numeric_or_alnum_tokens(nxt):
+                            if tok.upper() in {"BUN", "LPN", "PIECES", "TOTAL", "LBS"}:
+                                continue
+                            if token_is_total_lbs(tok):
+                                continue
+                            if token_is_candidate_lpn(tok):
+                                stacked_tokens.append(tok)
+
+                    if len(stacked_tokens) >= 2:
+                        break
+
+                    j += 1
+
+                if len(stacked_tokens) >= 2:
+                    lpn = stacked_tokens[0]
+                    pcs = stacked_tokens[1]
+
+                    if token_is_piece(str(pcs)):
+                        add_row(
+                            pdf.name,
+                            page_num,
+                            i + 1,
+                            grade_raw,
+                            thk,
+                            wid,
+                            leng,
+                            lpn,
+                            pcs,
+                            container,
+                            order,
+                            "stacked-lines",
+                        )
+
+                        i = j + 1
+                        continue
+
+                i += 1
+
+    pdf_df = pd.DataFrame(rows)
+    raw_lines_df = pd.DataFrame(raw_lines_rows)
+
+    if not pdf_df.empty:
+        pdf_df = pdf_df.drop_duplicates(
+            subset=["PDF_FILE", "PDF_PAGE", "PDF_LINE", "LPN", "PCS", "DABG_MATCH_KEY"],
+            keep="first",
+        ).reset_index(drop=True)
+
+    return pdf_df, raw_lines_df
 
 
 # ==================================================
@@ -534,17 +735,6 @@ def process_all(container_file, sku_file, pdf_files):
 
 
 def process_dabg(container_file, sku_file, pdf_files):
-    """
-    DABG process:
-      1. Read container list.
-      2. Build container key: THICKNESS|WIDTH|LENGTH|PCS.
-      3. Parse warehouse receipt PDF LPN rows.
-      4. Build PDF key: THICKNESS|WIDTH|LENGTH|PCS.
-      5. Consume one LPN per matching container row.
-      6. Never reuse LPNs.
-      7. Never make up missing LPNs.
-      8. Still perform SKU match using the existing grade-based SKU logic.
-    """
     raw_df = pd.read_excel(container_file, header=None, dtype=str)
     df = normalize_headers(raw_df).fillna("")
 
@@ -559,8 +749,6 @@ def process_dabg(container_file, sku_file, pdf_files):
     df["WIDTH"] = df["WIDTH"].apply(norm_int_str)
     df["LENGTH"] = df["LENGTH"].apply(norm_int_str)
 
-    # New container-side DABG key.
-    # No grade. Only dimensions + pieces.
     df["DABG_CONTAINER_MATCH_KEY"] = df.apply(
         lambda r: make_dabg_dim_pcs_key(
             r.get("THICKNESS", ""),
@@ -571,7 +759,7 @@ def process_dabg(container_file, sku_file, pdf_files):
         axis=1,
     )
 
-    pdf_df = parse_dabg_pdfs_lpn_rows(pdf_files)
+    pdf_df, raw_pdf_lines_df = parse_dabg_pdfs_lpn_rows(pdf_files)
 
     lpn_pool = defaultdict(deque)
 
@@ -585,7 +773,6 @@ def process_dabg(container_file, sku_file, pdf_files):
 
     assigned_lpns = []
     source_keys = []
-    pdf_match_keys = []
 
     for _, r in df.iterrows():
         key = r["DABG_CONTAINER_MATCH_KEY"]
@@ -593,11 +780,9 @@ def process_dabg(container_file, sku_file, pdf_files):
         if lpn_pool[key]:
             lpn = lpn_pool[key].popleft()
             assigned_lpns.append(lpn)
-            pdf_match_keys.append(key)
             source_keys.append(f"{key}|{lpn}")
         else:
             assigned_lpns.append("")
-            pdf_match_keys.append("")
             source_keys.append("")
 
     df["DABG_MATCH_KEY"] = df["DABG_CONTAINER_MATCH_KEY"]
@@ -605,7 +790,7 @@ def process_dabg(container_file, sku_file, pdf_files):
     df["DABG_MATCH_KEY_LPN"] = source_keys
     df["DABG LPN MATCH"] = df["DABG_PACKAGEID"].apply(lambda x: "YES" if str(x).strip() else "NO")
 
-    # SKU match stays the same. This still uses grade/description.
+    # SKU match still uses grade-based SKU lookup.
     sku_df = load_sku_lookup(sku_file)
 
     df["MAPPED DESCRIPTION"] = df["GRADE"].apply(map_description)
@@ -641,7 +826,7 @@ def process_dabg(container_file, sku_file, pdf_files):
 
     df = df[others + existing_priority]
 
-    return df, pdf_df
+    return df, pdf_df, raw_pdf_lines_df
 
 
 def fix_pcs_mismatch_use_container_truth(df: pd.DataFrame):
@@ -887,7 +1072,7 @@ with tab3:
     st.subheader("DABG Package ID Assignment")
 
     st.write(
-        "DABG now ignores grade for package assignment. "
+        "DABG ignores grade for package assignment. "
         "It matches container rows to PDF LPN rows using `THICKNESS|WIDTH|LENGTH|PCS`."
     )
 
@@ -900,21 +1085,28 @@ with tab3:
         st.info("Upload Container List + SKU Lookup + PDFs to run DABG assignment.")
     else:
         if st.button("Run DABG LPN Assignment"):
-            dabg_df, dabg_pdf_df = process_dabg(container_file, sku_file, pdf_files)
+            dabg_df, dabg_pdf_df, raw_pdf_lines_df = process_dabg(container_file, sku_file, pdf_files)
 
             st.session_state.dabg_df = dabg_df
             st.session_state.dabg_pdf_df = dabg_pdf_df
+            st.session_state.dabg_raw_pdf_lines_df = raw_pdf_lines_df
             st.session_state.dabg_sa_df = None
 
             assigned = int((dabg_df["DABG_PACKAGEID"].astype(str).str.strip() != "").sum())
             total = len(dabg_df)
+            parsed_pdf_rows = 0 if dabg_pdf_df is None or dabg_pdf_df.empty else len(dabg_pdf_df)
 
-            st.success(f"DABG assignment completed. Assigned {assigned} of {total} rows.")
+            st.success(
+                f"DABG assignment completed. Assigned {assigned} of {total} rows. "
+                f"Parsed {parsed_pdf_rows} PDF LPN rows."
+            )
 
         if st.session_state.dabg_pdf_df is not None:
-            with st.expander("Parsed PDF LPN Pool"):
+            with st.expander("Parsed PDF LPN Pool", expanded=True):
                 if st.session_state.dabg_pdf_df.empty:
-                    st.warning("No PDF LPN rows were parsed.")
+                    st.warning(
+                        "No PDF LPN rows were parsed. Open Raw PDF Extracted Lines below and check how PyPDF2 is reading the warehouse receipt."
+                    )
                 else:
                     st.dataframe(st.session_state.dabg_pdf_df, use_container_width=True)
 
@@ -923,6 +1115,26 @@ with tab3:
                         to_excel_bytes(st.session_state.dabg_pdf_df),
                         "DABG_Parsed_PDF_LPN_Pool.xlsx",
                     )
+
+                    key_counts = (
+                        st.session_state.dabg_pdf_df
+                        .groupby("DABG_MATCH_KEY", as_index=False)
+                        .agg(PDF_LPN_COUNT=("LPN", "count"))
+                        .sort_values("DABG_MATCH_KEY")
+                    )
+
+                    st.write("PDF LPN counts by DABG key:")
+                    st.dataframe(key_counts, use_container_width=True)
+
+        if st.session_state.dabg_raw_pdf_lines_df is not None:
+            with st.expander("Raw PDF Extracted Lines"):
+                st.dataframe(st.session_state.dabg_raw_pdf_lines_df, use_container_width=True)
+
+                st.download_button(
+                    "⬇️ Download Raw PDF Extracted Lines",
+                    to_excel_bytes(st.session_state.dabg_raw_pdf_lines_df),
+                    "DABG_Raw_PDF_Extracted_Lines.xlsx",
+                )
 
         if st.session_state.dabg_df is not None:
             dabg_df = st.session_state.dabg_df
@@ -942,6 +1154,34 @@ with tab3:
             c2.metric("Assigned LPNs", assigned_count)
             c3.metric("Missing LPNs", missing_lpn_count)
             c4.metric("Missing SKU Matches", sku_missing_count)
+
+            if st.session_state.dabg_pdf_df is not None and not st.session_state.dabg_pdf_df.empty:
+                container_keys = (
+                    dabg_df
+                    .groupby("DABG_CONTAINER_MATCH_KEY", as_index=False)
+                    .agg(CONTAINER_ROW_COUNT=("DABG_CONTAINER_MATCH_KEY", "count"))
+                    .rename(columns={"DABG_CONTAINER_MATCH_KEY": "DABG_MATCH_KEY"})
+                )
+
+                pdf_keys = (
+                    st.session_state.dabg_pdf_df
+                    .groupby("DABG_MATCH_KEY", as_index=False)
+                    .agg(PDF_LPN_COUNT=("LPN", "count"))
+                )
+
+                key_compare = container_keys.merge(pdf_keys, how="outer", on="DABG_MATCH_KEY").fillna(0)
+                key_compare["CONTAINER_ROW_COUNT"] = key_compare["CONTAINER_ROW_COUNT"].astype(int)
+                key_compare["PDF_LPN_COUNT"] = key_compare["PDF_LPN_COUNT"].astype(int)
+                key_compare["SHORTAGE"] = key_compare["CONTAINER_ROW_COUNT"] - key_compare["PDF_LPN_COUNT"]
+
+                with st.expander("DABG Key Compare Container vs PDF"):
+                    st.dataframe(key_compare.sort_values("DABG_MATCH_KEY"), use_container_width=True)
+
+                    st.download_button(
+                        "⬇️ Download DABG Key Compare",
+                        to_excel_bytes(key_compare),
+                        "DABG_Key_Compare.xlsx",
+                    )
 
             unmatched_lpn = dabg_df[dabg_df["DABG_PACKAGEID"].astype(str).str.strip() == ""]
             unmatched_sku = dabg_df[dabg_df["MATCH"].astype(str).str.upper() != "YES"]
