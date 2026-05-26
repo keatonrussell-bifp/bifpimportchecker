@@ -55,14 +55,6 @@ def normalize_headers(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def norm_id(x) -> str:
-    """
-    Normalize IDs like:
-      - 7052583281.0 -> 7052583281
-      - '7052583281  -> 7052583281
-      - 7.05258E+09  -> 7052583281
-      - CHS2020      -> CHS2020
-      - 208          -> 208
-    """
     if pd.isna(x):
         return ""
 
@@ -110,10 +102,6 @@ def series_digits_only(s: pd.Series) -> bool:
 
 
 def col_or_default(df: pd.DataFrame, col: str, default):
-    """
-    Always return a Series aligned to df.index.
-    Prevents .fillna errors when df.get(col, scalar) would return a scalar.
-    """
     if df is None:
         return pd.Series([], dtype="object")
 
@@ -127,19 +115,6 @@ def col_or_default(df: pd.DataFrame, col: str, default):
 # SKU Logic
 # ==================================================
 def map_description(grade) -> str:
-    """
-    Maps container/PDF grade text to SKU lookup DESCRIPTION.
-
-    Rules:
-      - If grade blank -> DOG EAR
-      - If FB -> DOG EAR
-      - If contains APG -> TAEDA PINE APG
-      - If contains DOG -> DOG EAR
-      - If contains FENCE -> DOG EAR
-      - If contains III or III/V or 3COM -> TAEDA PINE #3 COMMON
-      - If contains D-Grade / GS-D-Grade / D GRADE -> TAEDA PINE D
-      - Otherwise -> "" because guessing creates bad SKU matches
-    """
     g = "" if pd.isna(grade) else str(grade).strip().upper()
 
     if g == "":
@@ -221,11 +196,6 @@ def load_sku_lookup(sku_file) -> pd.DataFrame:
 # PDF Header Extraction
 # ==================================================
 def extract_container_and_order(full_text: str, filename: str):
-    """
-    Extracts:
-      - Container: ABCD1234567 style
-      - Order: 77660-2 / 81804-2 style, usually near P.O.
-    """
     container = ""
 
     m = re.search(r"\b([A-Z]{4}\d{7})\b", full_text)
@@ -263,12 +233,6 @@ def extract_container_and_order(full_text: str, filename: str):
 # Existing PDF Line Item Parser
 # ==================================================
 def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
-    """
-    Existing parser for the original receive/Sales Assist workflow.
-
-    Returns columns:
-      PACKAGEID, PCS, QTY, GRADE, THICKNESS, WIDTH, LENGTH, CONTAINER, ORDERNUMBER, PDF_FILE
-    """
     dim_pat = re.compile(r"^\d+\s*[Xx]\s*\d+\s*[Xx]\s*\d+$")
     int_pat = re.compile(r"^\d+$")
 
@@ -397,54 +361,15 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
 # ==================================================
 # DABG Helpers
 # ==================================================
-def normalize_dabg_grade_key(grade) -> str:
+def make_dabg_dim_pcs_key(thickness, width, length, pcs) -> str:
     """
-    Normalizes grade only for DABG matching.
+    DABG matching ignores grade.
 
-    Examples:
-      GS-APG -> APG
-      APG    -> APG
-      GS-D   -> D
-      FB     -> DOG EAR
-    """
-    if pd.isna(grade):
-        return ""
-
-    g = str(grade).strip().upper()
-    g = re.sub(r"^GS[-\s]*", "", g).strip()
-
-    if "APG" in g:
-        return "APG"
-
-    if g == "FB":
-        return "DOG EAR"
-
-    if g in ("DOG", "DOG EAR") or "DOG" in g:
-        return "DOG EAR"
-
-    if "FENCE" in g:
-        return "DOG EAR"
-
-    if "D-GRADE" in g or "D GRADE" in g or g in ("D", "GRADE D"):
-        return "D"
-
-    if "III/V" in g or "III" in g or "3COM" in g:
-        return "III"
-
-    return g
-
-
-def make_dabg_match_key(grade, thickness, width, length, pcs) -> str:
-    """
-    Container side example:
-      GS-APG, 1, 4, 144, 240 -> APG|1|4|144|240
-
-    PDF side example:
-      APG 1x4x144 LPN 208 PCS 240 -> APG|1|4|144|240
+    Example:
+      1, 4, 144, 240 -> 1|4|144|240
     """
     return (
-        normalize_dabg_grade_key(grade) + "|"
-        + norm_int_str(thickness) + "|"
+        norm_int_str(thickness) + "|"
         + norm_int_str(width) + "|"
         + norm_int_str(length) + "|"
         + norm_int_str(pcs)
@@ -455,24 +380,20 @@ def parse_dabg_pdfs_lpn_rows(pdf_files) -> pd.DataFrame:
     """
     Parses warehouse receipt PDFs into LPN rows for DABG.
 
-    Match key:
-      DABG_MATCH_KEY = GRADE|THICKNESS|WIDTH|LENGTH|PCS
-
-    Assignment key:
-      DABG_MATCH_KEY_LPN = GRADE|THICKNESS|WIDTH|LENGTH|PCS|LPN
+    New DABG key ignores grade:
+      DABG_MATCH_KEY = THICKNESS|WIDTH|LENGTH|PCS
 
     Example:
-      APG|1|4|144|240|208
+      1|4|144|240
 
-    Important:
-      This only parses LPNs actually present in the PDFs.
-      Consumption happens later in process_dabg().
+    Full consumed key:
+      DABG_MATCH_KEY_LPN = THICKNESS|WIDTH|LENGTH|PCS|LPN
+
+    Example:
+      1|4|144|240|208
     """
     rows = []
 
-    # Common warehouse receipt shape after PyPDF2 extraction:
-    # APG 1x8x144 (BUN: 208 120 0.0000
-    # APG 1x4x144 (BUN: 208 240 0.0000
     receipt_line_pat = re.compile(
         r"""
         ^\s*
@@ -524,15 +445,14 @@ def parse_dabg_pdfs_lpn_rows(pdf_files) -> pd.DataFrame:
                 if not lpn or not pcs:
                     continue
 
-                grade_key = normalize_dabg_grade_key(grade_raw)
-                match_key = make_dabg_match_key(grade_key, thk, wid, leng, pcs)
+                match_key = make_dabg_dim_pcs_key(thk, wid, leng, pcs)
 
                 rows.append(
                     {
                         "PDF_FILE": pdf.name,
                         "PDF_PAGE": page_num,
                         "PDF_LINE": line_num,
-                        "GRADE": grade_key,
+                        "PDF_GRADE_RAW": grade_raw,
                         "THICKNESS": thk,
                         "WIDTH": wid,
                         "LENGTH": leng,
@@ -617,13 +537,13 @@ def process_dabg(container_file, sku_file, pdf_files):
     """
     DABG process:
       1. Read container list.
-      2. Build container match key: GRADE|THICKNESS|WIDTH|LENGTH|PCS.
+      2. Build container key: THICKNESS|WIDTH|LENGTH|PCS.
       3. Parse warehouse receipt PDF LPN rows.
-      4. Build PDF match key: GRADE|THICKNESS|WIDTH|LENGTH|PCS.
+      4. Build PDF key: THICKNESS|WIDTH|LENGTH|PCS.
       5. Consume one LPN per matching container row.
       6. Never reuse LPNs.
       7. Never make up missing LPNs.
-      8. Still perform SKU match.
+      8. Still perform SKU match using the existing grade-based SKU logic.
     """
     raw_df = pd.read_excel(container_file, header=None, dtype=str)
     df = normalize_headers(raw_df).fillna("")
@@ -639,11 +559,10 @@ def process_dabg(container_file, sku_file, pdf_files):
     df["WIDTH"] = df["WIDTH"].apply(norm_int_str)
     df["LENGTH"] = df["LENGTH"].apply(norm_int_str)
 
-    df["DABG_GRADE_KEY"] = df["GRADE"].apply(normalize_dabg_grade_key)
-
-    df["DABG_MATCH_KEY"] = df.apply(
-        lambda r: make_dabg_match_key(
-            r.get("GRADE", ""),
+    # New container-side DABG key.
+    # No grade. Only dimensions + pieces.
+    df["DABG_CONTAINER_MATCH_KEY"] = df.apply(
+        lambda r: make_dabg_dim_pcs_key(
             r.get("THICKNESS", ""),
             r.get("WIDTH", ""),
             r.get("LENGTH", ""),
@@ -666,22 +585,27 @@ def process_dabg(container_file, sku_file, pdf_files):
 
     assigned_lpns = []
     source_keys = []
+    pdf_match_keys = []
 
     for _, r in df.iterrows():
-        key = r["DABG_MATCH_KEY"]
+        key = r["DABG_CONTAINER_MATCH_KEY"]
 
         if lpn_pool[key]:
             lpn = lpn_pool[key].popleft()
             assigned_lpns.append(lpn)
+            pdf_match_keys.append(key)
             source_keys.append(f"{key}|{lpn}")
         else:
             assigned_lpns.append("")
+            pdf_match_keys.append("")
             source_keys.append("")
 
+    df["DABG_MATCH_KEY"] = df["DABG_CONTAINER_MATCH_KEY"]
     df["DABG_PACKAGEID"] = assigned_lpns
     df["DABG_MATCH_KEY_LPN"] = source_keys
     df["DABG LPN MATCH"] = df["DABG_PACKAGEID"].apply(lambda x: "YES" if str(x).strip() else "NO")
 
+    # SKU match stays the same. This still uses grade/description.
     sku_df = load_sku_lookup(sku_file)
 
     df["MAPPED DESCRIPTION"] = df["GRADE"].apply(map_description)
@@ -703,7 +627,7 @@ def process_dabg(container_file, sku_file, pdf_files):
     df = df.fillna("")
 
     priority_cols = [
-        "DABG_GRADE_KEY",
+        "DABG_CONTAINER_MATCH_KEY",
         "DABG_MATCH_KEY",
         "DABG_PACKAGEID",
         "DABG_MATCH_KEY_LPN",
@@ -721,15 +645,6 @@ def process_dabg(container_file, sku_file, pdf_files):
 
 
 def fix_pcs_mismatch_use_container_truth(df: pd.DataFrame):
-    """
-    Container list PCS is truth.
-
-    Fix only audit columns:
-      PCS CHECK <- PCS
-      PCS MATCH <- YES
-
-    Does not modify PCS.
-    """
     if df is None or df.empty:
         return df, 0
 
@@ -759,17 +674,6 @@ def fix_pcs_mismatch_use_container_truth(df: pd.DataFrame):
 # Sales Assist Generator
 # ==================================================
 def generate_sales_assist(df: pd.DataFrame, identifier_col: str = "PACKAGEID") -> pd.DataFrame:
-    """
-    Sales Assist column names stay exactly the same.
-
-    Existing workflows:
-      generate_sales_assist(df)
-
-    DABG workflow:
-      generate_sales_assist(df, identifier_col="DABG_PACKAGEID")
-
-    That makes Sales Assist Identifier use the consumed PDF LPNs.
-    """
     order_raw = col_or_default(df, "ORDERNUMBER", "").astype(str).str.split("-").str[0].str.strip()
 
     if series_digits_only(order_raw):
@@ -983,14 +887,13 @@ with tab3:
     st.subheader("DABG Package ID Assignment")
 
     st.write(
-        "This matches container rows to warehouse receipt PDF LPNs using "
-        "`GRADE|THICKNESS|WIDTH|LENGTH|PCS`. "
-        "Each matching PDF LPN is consumed once and placed into `DABG_PACKAGEID`."
+        "DABG now ignores grade for package assignment. "
+        "It matches container rows to PDF LPN rows using `THICKNESS|WIDTH|LENGTH|PCS`."
     )
 
     st.write(
-        "Example container key: `APG|1|4|144|240`. "
-        "Example consumed PDF key: `APG|1|4|144|240|208`."
+        "Example container key: `1|4|144|240`. "
+        "Example consumed PDF key: `1|4|144|240|208`."
     )
 
     if not (container_file and sku_file and pdf_files):
@@ -1031,7 +934,6 @@ with tab3:
 
             assigned_count = int((dabg_df["DABG_PACKAGEID"].astype(str).str.strip() != "").sum())
             missing_lpn_count = int((dabg_df["DABG_PACKAGEID"].astype(str).str.strip() == "").sum())
-            sku_match_count = int((dabg_df["MATCH"].astype(str).str.upper() == "YES").sum())
             sku_missing_count = int((dabg_df["MATCH"].astype(str).str.upper() != "YES").sum())
 
             c1, c2, c3, c4 = st.columns(4)
