@@ -412,7 +412,7 @@ def process_all(container_file, sku_file, pdf_files):
     audit_cols = ["PDF LPN", "RECEIVE MATCH", "PCS CHECK", "PCS MATCH", "SKU", "MATCH"]
     existing_audit = [c for c in audit_cols if c in df.columns]
     others = [c for c in df.columns if c not in existing_audit]
-        df = df[others + existing_audit]
+    df = df[others + existing_audit]
 
     return df
 
