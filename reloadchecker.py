@@ -472,20 +472,6 @@ def generate_sales_assist(df: pd.DataFrame) -> pd.DataFrame:
         leng = pd.to_numeric(col_or_default(df, "LENGTH", 0), errors="coerce").fillna(0)
         qty = (pcs * (thk * wid * leng) / 144.0).round().fillna(0).astype(int)
 
-    # PACKAGEID comparison columns
-    # Full Match export:
-    #   PACKAGEID = container list PACKAGEID
-    #   PDF LPN   = matched PACKAGEID from PDF
-    #
-    # PDF-only export:
-    #   PACKAGEID came from the PDF, so container package is blank
-    if "PDF LPN" in df.columns:
-        container_package_id = col_or_default(df, "PACKAGEID", "").astype(str).str.strip()
-        pdf_package_id = col_or_default(df, "PDF LPN", "").astype(str).str.strip()
-    else:
-        container_package_id = pd.Series([""] * len(df), index=df.index)
-        pdf_package_id = col_or_default(df, "PACKAGEID", "").astype(str).str.strip()
-
     return pd.DataFrame(
         {
             "SKU": col_or_default(df, "SKU", ""),
@@ -499,10 +485,6 @@ def generate_sales_assist(df: pd.DataFrame) -> pd.DataFrame:
             "ReloadReference": "",
             "Identifier": ident_out,
             "ProFormaPrice": 0,
-
-            # New columns only
-            "ContainerList_PACKAGEID": container_package_id,
-            "PDF_PACKAGEID": pdf_package_id,
         }
     )
 
