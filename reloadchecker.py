@@ -407,29 +407,35 @@ def extract_raw_pdf_lines(pdf_files) -> pd.DataFrame:
 
     return pd.DataFrame(rows)
 
-
-def parse_dabg_pdfs_lpn_rows(pdf_files):
+def parse_dabg_pdfs_lpn_rows(pdf_files, valid_container_keys=None):
     """
     Parses warehouse receipt PDFs into LPN rows for DABG.
-
-    Correct PDF layout:
-      ITEM / DIMENSION / LPN / PIECES / TOTAL LBS
 
     DABG key ignores grade:
       DABG_MATCH_KEY = THICKNESS|WIDTH|LENGTH|PCS
 
-    Full consumed key:
-      DABG_MATCH_KEY_LPN = THICKNESS|WIDTH|LENGTH|PCS|LPN
+    The PDF extraction can flip LPN and PCS depending on layout.
+    So this parser tests both possible interpretations against the
+    container list keys.
 
-    Example PDF row:
-      APG 1x6x144 ... 213 160 0.0000
+    Example extracted numbers after dimension:
+      208 and 120
 
-    Correct output:
-      DABG_MATCH_KEY     = 1|6|144|160
-      DABG_MATCH_KEY_LPN = 1|6|144|160|213
+    Possibility A:
+      PCS = 120, LPN = 208, key = 1|8|144|120
+
+    Possibility B:
+      PCS = 208, LPN = 120, key = 1|8|144|208
+
+    If only one key exists in the container list, that one wins.
     """
     rows = []
     raw_lines_rows = []
+
+    if valid_container_keys is None:
+        valid_container_keys = set()
+    else:
+        valid_container_keys = set(str(x).strip() for x in valid_container_keys if str(x).strip())
 
     item_pat = re.compile(
         r"""
@@ -449,26 +455,36 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
         "LPN", "PIECES", "TOTAL", "TOTAL LBS", "WAREHOUSE",
         "RECEIPT", "PAGE", "TRANSACTION", "CONTAINER", "CARRIER",
         "RECVD", "FROM", "FOR", "ACCOUNT", "SPECIAL", "INSTRUCTIONS",
+        "BUN", "BUNDLE",
     }
 
     def looks_like_header(line: str) -> bool:
         up = line.upper().strip()
+
         if up in header_words:
             return True
+
         if "ITEM" in up and "LPN" in up and "PIECES" in up:
             return True
+
         if "WAREHOUSE RECEIPT" in up:
             return True
+
         if up.startswith("PAGE "):
             return True
+
         if up.startswith("TRANSACTION"):
             return True
+
         if up.startswith("RECEIPT"):
             return True
+
         if up.startswith("CONTAINER"):
             return True
+
         if up.startswith("P.O."):
             return True
+
         return False
 
     def token_is_total_lbs(tok: str) -> bool:
@@ -478,34 +494,85 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
     def numeric_or_alnum_tokens(text: str):
         return re.findall(r"[A-Za-z0-9\-]+|\d+\.\d+", text)
 
-    def is_valid_lpn(tok: str) -> bool:
-        tok = str(tok).strip()
-        if not tok:
-            return False
-        if tok.upper() in header_words:
-            return False
-        if token_is_total_lbs(tok):
-            return False
-        return bool(re.fullmatch(r"[A-Za-z0-9\-]+", tok))
-
     def is_valid_pcs(tok: str) -> bool:
         tok = str(tok).strip()
+
         if not re.fullmatch(r"\d+", tok):
             return False
+
         n = int(tok)
+
         return 1 <= n <= 10000
 
-    def add_row(pdf_name, page_num, line_num, grade_raw, thk, wid, leng, lpn, pcs, container, order, source_method):
+    def is_valid_lpn(tok: str) -> bool:
+        tok = str(tok).strip()
+
+        if not tok:
+            return False
+
+        if tok.upper() in header_words:
+            return False
+
+        if token_is_total_lbs(tok):
+            return False
+
+        return bool(re.fullmatch(r"[A-Za-z0-9\-]+", tok))
+
+    def choose_lpn_and_pcs(thk, wid, leng, token_a, token_b):
+        """
+        Given two tokens after the dimension, determine which is PCS
+        by checking the container list keys.
+
+        Returns:
+          lpn, pcs, decision
+        """
+        a = norm_id(token_a)
+        b = norm_id(token_b)
+
+        key_if_b_is_pcs = make_dabg_dim_pcs_key(thk, wid, leng, b)
+        key_if_a_is_pcs = make_dabg_dim_pcs_key(thk, wid, leng, a)
+
+        b_matches_container = key_if_b_is_pcs in valid_container_keys
+        a_matches_container = key_if_a_is_pcs in valid_container_keys
+
+        # Preferred: exactly one side matches the container list.
+        if b_matches_container and not a_matches_container:
+            return a, b, "container-key-selected-second-token-as-pcs"
+
+        if a_matches_container and not b_matches_container:
+            return b, a, "container-key-selected-first-token-as-pcs"
+
+        # If both match, fall back to the more likely business rule:
+        # pieces are usually 120, 160, 180, 200, 208, 216, 220, 224, 228, 232, 236, 240, 248, 256, etc.
+        # LPNs on these warehouse receipts are also small numbers, so this is ambiguous.
+        # In this case, preserve visual/table assumption: token_a = LPN, token_b = PCS.
+        if b_matches_container and a_matches_container:
+            return a, b, "both-possible-default-second-token-as-pcs"
+
+        # If neither matches, still return something so diagnostics show the row.
+        # Default to token_a=LPN and token_b=PCS.
+        return a, b, "no-container-key-match-default-second-token-as-pcs"
+
+    def add_row(pdf_name, page_num, line_num, grade_raw, thk, wid, leng, token_a, token_b, container, order, source_method):
         thk = norm_int_str(thk)
         wid = norm_int_str(wid)
         leng = norm_int_str(leng)
+
+        if not thk or not wid or not leng:
+            return
+
+        lpn, pcs, decision = choose_lpn_and_pcs(thk, wid, leng, token_a, token_b)
+
         pcs = norm_int_str(pcs)
         lpn = norm_id(lpn)
 
-        if not thk or not wid or not leng or not pcs or not lpn:
+        if not pcs or not lpn:
             return
 
         if not is_valid_pcs(pcs):
+            return
+
+        if not is_valid_lpn(lpn):
             return
 
         key = make_dabg_dim_pcs_key(thk, wid, leng, pcs)
@@ -526,6 +593,9 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
                 "CONTAINER": container,
                 "ORDERNUMBER": order,
                 "SOURCE_METHOD": source_method,
+                "TOKEN_A": token_a,
+                "TOKEN_B": token_b,
+                "PARSE_DECISION": decision,
             }
         )
 
@@ -577,7 +647,7 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
 
                 toks = [
                     t for t in toks
-                    if t.upper() not in {"BUN", "LPN", "PIECES", "TOTAL", "LBS"}
+                    if t.upper() not in {"BUN", "BUNDLE", "LPN", "PIECES", "TOTAL", "LBS"}
                 ]
 
                 toks = [
@@ -585,39 +655,39 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
                     if not token_is_total_lbs(t)
                 ]
 
-                # Same-line case:
-                # APG 1x6x144 (BUN: 213 160 0.0000
+                # Same-line case.
+                # The two tokens may be either:
+                #   LPN PCS
+                # or:
+                #   PCS LPN
                 #
-                # Correct:
-                # LPN = 213
-                # PCS = 160
+                # We do not assume. We check against container keys.
                 if len(toks) >= 2:
-                    lpn = toks[0]
-                    pcs = toks[1]
+                    token_a = toks[0]
+                    token_b = toks[1]
 
-                    if is_valid_lpn(lpn) and is_valid_pcs(pcs):
-                        add_row(
-                            pdf.name,
-                            page_num,
-                            i + 1,
-                            grade_raw,
-                            thk,
-                            wid,
-                            leng,
-                            lpn,
-                            pcs,
-                            container,
-                            order,
-                            "same-line-lpn-pcs",
-                        )
+                    add_row(
+                        pdf.name,
+                        page_num,
+                        i + 1,
+                        grade_raw,
+                        thk,
+                        wid,
+                        leng,
+                        token_a,
+                        token_b,
+                        container,
+                        order,
+                        "same-line-container-key-resolved",
+                    )
 
-                        i += 1
-                        continue
+                    i += 1
+                    continue
 
                 # Stacked extraction case:
-                # APG 1x6x144 (BUN:
-                # 213
-                # 160
+                # APG 1x8x144 (BUN:
+                # 208
+                # 120
                 # 0.0000
                 stacked_tokens = []
 
@@ -631,10 +701,12 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
 
                     if not looks_like_header(nxt):
                         for tok in numeric_or_alnum_tokens(nxt):
-                            if tok.upper() in {"BUN", "LPN", "PIECES", "TOTAL", "LBS"}:
+                            if tok.upper() in {"BUN", "BUNDLE", "LPN", "PIECES", "TOTAL", "LBS"}:
                                 continue
+
                             if token_is_total_lbs(tok):
                                 continue
+
                             stacked_tokens.append(tok)
 
                     if len(stacked_tokens) >= 2:
@@ -643,27 +715,26 @@ def parse_dabg_pdfs_lpn_rows(pdf_files):
                     j += 1
 
                 if len(stacked_tokens) >= 2:
-                    lpn = stacked_tokens[0]
-                    pcs = stacked_tokens[1]
+                    token_a = stacked_tokens[0]
+                    token_b = stacked_tokens[1]
 
-                    if is_valid_lpn(lpn) and is_valid_pcs(pcs):
-                        add_row(
-                            pdf.name,
-                            page_num,
-                            i + 1,
-                            grade_raw,
-                            thk,
-                            wid,
-                            leng,
-                            lpn,
-                            pcs,
-                            container,
-                            order,
-                            "stacked-lines-lpn-pcs",
-                        )
+                    add_row(
+                        pdf.name,
+                        page_num,
+                        i + 1,
+                        grade_raw,
+                        thk,
+                        wid,
+                        leng,
+                        token_a,
+                        token_b,
+                        container,
+                        order,
+                        "stacked-lines-container-key-resolved",
+                    )
 
-                        i = j + 1
-                        continue
+                    i = j + 1
+                    continue
 
                 i += 1
 
@@ -770,7 +841,12 @@ def process_dabg(container_file, sku_file, pdf_files):
         axis=1,
     )
 
-    pdf_df, raw_pdf_lines_df = parse_dabg_pdfs_lpn_rows(pdf_files)
+    valid_container_keys = set(df["DABG_CONTAINER_MATCH_KEY"].astype(str).str.strip())
+
+    pdf_df, raw_pdf_lines_df = parse_dabg_pdfs_lpn_rows(
+        pdf_files,
+        valid_container_keys=valid_container_keys,
+    )
 
     lpn_pool = defaultdict(deque)
 
@@ -801,7 +877,6 @@ def process_dabg(container_file, sku_file, pdf_files):
     df["DABG_MATCH_KEY_LPN"] = source_keys
     df["DABG LPN MATCH"] = df["DABG_PACKAGEID"].apply(lambda x: "YES" if str(x).strip() else "NO")
 
-    # SKU match still uses grade-based SKU lookup.
     sku_df = load_sku_lookup(sku_file)
 
     df["MAPPED DESCRIPTION"] = df["GRADE"].apply(map_description)
