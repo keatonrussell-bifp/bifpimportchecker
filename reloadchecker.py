@@ -414,20 +414,16 @@ def parse_dabg_pdfs_lpn_rows(pdf_files, valid_container_keys=None):
     DABG key ignores grade:
       DABG_MATCH_KEY = THICKNESS|WIDTH|LENGTH|PCS
 
-    The PDF extraction can flip LPN and PCS depending on layout.
-    So this parser tests both possible interpretations against the
-    container list keys.
+    On these North Florida Warehouse receipts the LPN is a two-part value
+    such as "CHS 5772" (an alpha prefix plus a number). PyPDF2 emits the
+    prefix and the number as SEPARATE tokens, and the column order varies
+    between files, e.g.:
 
-    Example extracted numbers after dimension:
-      208 and 120
+        APG 1x6x144 (BUN: 160 CHS 6964 0.0000   ->  PIECES=160  LPN="CHS 6964"
+        APG 1x6x144 (BUN: CHS 5772 160 0.0000   ->  LPN="CHS 5772"  PIECES=160
 
-    Possibility A:
-      PCS = 120, LPN = 208, key = 1|8|144|120
-
-    Possibility B:
-      PCS = 208, LPN = 120, key = 1|8|144|208
-
-    If only one key exists in the container list, that one wins.
+    resolve_dabg_lpn_pcs rebuilds the FULL LPN (prefix + number) and uses the
+    container dim/pcs key list to pin down which number is the piece count.
     """
     rows = []
     raw_lines_rows = []
@@ -516,15 +512,13 @@ def parse_dabg_pdfs_lpn_rows(pdf_files, valid_container_keys=None):
         if token_is_total_lbs(tok):
             return False
 
-        return bool(re.fullmatch(r"[A-Za-z0-9\-]+", tok))
+        # Allow an internal space so two-part LPNs like "CHS 5772" survive.
+        return bool(re.fullmatch(r"[A-Za-z0-9\- ]+", tok))
 
     def choose_lpn_and_pcs(thk, wid, leng, token_a, token_b):
         """
-        Given two tokens after the dimension, determine which is PCS
-        by checking the container list keys.
-
-        Returns:
-          lpn, pcs, decision
+        Legacy two-token resolver. Kept for reference; the DABG path now uses
+        resolve_dabg_lpn_pcs so the full LPN (prefix + number) is preserved.
         """
         a = norm_id(token_a)
         b = norm_id(token_b)
@@ -535,25 +529,88 @@ def parse_dabg_pdfs_lpn_rows(pdf_files, valid_container_keys=None):
         b_matches_container = key_if_b_is_pcs in valid_container_keys
         a_matches_container = key_if_a_is_pcs in valid_container_keys
 
-        # Preferred: exactly one side matches the container list.
         if b_matches_container and not a_matches_container:
             return a, b, "container-key-selected-second-token-as-pcs"
 
         if a_matches_container and not b_matches_container:
             return b, a, "container-key-selected-first-token-as-pcs"
 
-        # If both match, fall back to the more likely business rule:
-        # pieces are usually 120, 160, 180, 200, 208, 216, 220, 224, 228, 232, 236, 240, 248, 256, etc.
-        # LPNs on these warehouse receipts are also small numbers, so this is ambiguous.
-        # In this case, preserve visual/table assumption: token_a = LPN, token_b = PCS.
         if b_matches_container and a_matches_container:
             return a, b, "both-possible-default-second-token-as-pcs"
 
-        # If neither matches, still return something so diagnostics show the row.
-        # Default to token_a=LPN and token_b=PCS.
         return a, b, "no-container-key-match-default-second-token-as-pcs"
 
-    def add_row(pdf_name, page_num, line_num, grade_raw, thk, wid, leng, token_a, token_b, container, order, source_method):
+    def resolve_dabg_lpn_pcs(thk, wid, leng, toks):
+        """
+        Rebuild the FULL LPN and identify PCS from the post-dimension tokens.
+
+        - prefix      = first pure-alpha token (e.g. "CHS")
+        - lpn_number  = the digits that belong with the prefix
+        - pcs         = the numeric token whose THK|WID|LEN|PCS key is in the
+                        container list; this is what disambiguates pcs vs lpn#
+
+        The full LPN is returned as "<prefix> <lpn_number>", e.g. "CHS 5772".
+        """
+        toks = [str(t).strip() for t in toks if str(t).strip()]
+
+        prefix = ""
+        prefix_idx = None
+        for idx, t in enumerate(toks):
+            if re.fullmatch(r"[A-Za-z]+", t):
+                prefix = t
+                prefix_idx = idx
+                break
+
+        numerics = [t for t in toks if re.fullmatch(r"\d+", t)]
+
+        # PCS = the numeric whose dimension+pcs key exists in the container list.
+        pcs = ""
+        for n in numerics:
+            if make_dabg_dim_pcs_key(thk, wid, leng, n) in valid_container_keys:
+                pcs = n
+                break
+
+        # LPN number = the digits paired with the prefix.
+        # Prefer the first numeric AFTER the prefix that is not the PCS,
+        # then the first numeric BEFORE the prefix that is not the PCS,
+        # then any remaining numeric.
+        lpn_number = ""
+        if prefix_idx is not None:
+            for t in toks[prefix_idx + 1:]:
+                if re.fullmatch(r"\d+", t) and t != pcs:
+                    lpn_number = t
+                    break
+            if not lpn_number:
+                for t in reversed(toks[:prefix_idx]):
+                    if re.fullmatch(r"\d+", t) and t != pcs:
+                        lpn_number = t
+                        break
+        if not lpn_number:
+            for t in numerics:
+                if t != pcs:
+                    lpn_number = t
+                    break
+
+        if prefix and lpn_number:
+            lpn = prefix + " " + lpn_number
+            decision = "dabg-prefix-merged-lpn"
+        elif prefix:
+            lpn = prefix
+            decision = "dabg-prefix-only-no-number"
+        else:
+            lpn = lpn_number
+            decision = "dabg-numeric-lpn"
+
+        # Fallback PCS when the container list has no matching key.
+        if not pcs:
+            leftover = [t for t in numerics if t != lpn_number]
+            if leftover:
+                pcs = leftover[0]
+                decision = decision + "-pcs-fallback"
+
+        return lpn, pcs, prefix, lpn_number, decision
+
+    def add_row(pdf_name, page_num, line_num, grade_raw, thk, wid, leng, toks, container, order, source_method):
         thk = norm_int_str(thk)
         wid = norm_int_str(wid)
         leng = norm_int_str(leng)
@@ -561,7 +618,7 @@ def parse_dabg_pdfs_lpn_rows(pdf_files, valid_container_keys=None):
         if not thk or not wid or not leng:
             return
 
-        lpn, pcs, decision = choose_lpn_and_pcs(thk, wid, leng, token_a, token_b)
+        lpn, pcs, prefix, lpn_number, decision = resolve_dabg_lpn_pcs(thk, wid, leng, toks)
 
         pcs = norm_int_str(pcs)
         lpn = norm_id(lpn)
@@ -593,8 +650,8 @@ def parse_dabg_pdfs_lpn_rows(pdf_files, valid_container_keys=None):
                 "CONTAINER": container,
                 "ORDERNUMBER": order,
                 "SOURCE_METHOD": source_method,
-                "TOKEN_A": token_a,
-                "TOKEN_B": token_b,
+                "TOKEN_A": prefix,
+                "TOKEN_B": lpn_number,
                 "PARSE_DECISION": decision,
             }
         )
@@ -656,16 +713,11 @@ def parse_dabg_pdfs_lpn_rows(pdf_files, valid_container_keys=None):
                 ]
 
                 # Same-line case.
-                # The two tokens may be either:
-                #   LPN PCS
-                # or:
-                #   PCS LPN
-                #
-                # We do not assume. We check against container keys.
+                # The tokens after the dimension contain, in some order:
+                #   PIECES, the LPN prefix (CHS), and the LPN number.
+                # resolve_dabg_lpn_pcs figures out which is which and rebuilds
+                # the full LPN, so we hand it the whole token list.
                 if len(toks) >= 2:
-                    token_a = toks[0]
-                    token_b = toks[1]
-
                     add_row(
                         pdf.name,
                         page_num,
@@ -674,11 +726,10 @@ def parse_dabg_pdfs_lpn_rows(pdf_files, valid_container_keys=None):
                         thk,
                         wid,
                         leng,
-                        token_a,
-                        token_b,
+                        toks,
                         container,
                         order,
-                        "same-line-container-key-resolved",
+                        "same-line-prefix-merged",
                     )
 
                     i += 1
@@ -686,8 +737,9 @@ def parse_dabg_pdfs_lpn_rows(pdf_files, valid_container_keys=None):
 
                 # Stacked extraction case:
                 # APG 1x8x144 (BUN:
-                # 208
-                # 120
+                # 160
+                # CHS
+                # 5772
                 # 0.0000
                 stacked_tokens = []
 
@@ -709,15 +761,13 @@ def parse_dabg_pdfs_lpn_rows(pdf_files, valid_container_keys=None):
 
                             stacked_tokens.append(tok)
 
-                    if len(stacked_tokens) >= 2:
+                    # Collect enough tokens (pieces + prefix + lpn number) before stopping.
+                    if len(stacked_tokens) >= 4:
                         break
 
                     j += 1
 
                 if len(stacked_tokens) >= 2:
-                    token_a = stacked_tokens[0]
-                    token_b = stacked_tokens[1]
-
                     add_row(
                         pdf.name,
                         page_num,
@@ -726,11 +776,10 @@ def parse_dabg_pdfs_lpn_rows(pdf_files, valid_container_keys=None):
                         thk,
                         wid,
                         leng,
-                        token_a,
-                        token_b,
+                        stacked_tokens,
                         container,
                         order,
-                        "stacked-lines-container-key-resolved",
+                        "stacked-lines-prefix-merged",
                     )
 
                     i = j + 1
