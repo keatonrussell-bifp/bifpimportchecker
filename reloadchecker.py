@@ -237,9 +237,223 @@ def extract_container_and_order(full_text: str, filename: str):
 
 
 # ==================================================
-# Existing PDF Line Item Parser
+# Receive Summary Ticket Parser (Grane Laramie)
+# ==================================================
+def is_receive_summary_ticket(full_text: str) -> bool:
+    """Identify the new Grane Laramie receive-summary layout."""
+    up = (full_text or "").upper()
+    return "RECEIVE SUMMARY TICKET" in up and "DETAILS:" in up and "LOT#:" in up
+
+
+def parse_receive_summary_ticket(
+    pdf_name: str,
+    pages_text,
+    package_id_whitelist=None,
+):
+    """
+    Parse Birmingham International / Grane Laramie Receive Summary Tickets.
+
+    The item dimensions and grade are printed once, followed by one or more
+    detail rows. Each detail row becomes one normal import-generator row:
+
+      PACKAGEID = Lot#
+      PCS       = detail Qty
+      QTY       = board feet calculated from PCS and dimensions
+
+    Item context is kept across page breaks because some receipts continue a
+    detail group on the following page before printing the next item heading.
+    """
+    dim_pat = re.compile(
+        r'^\s*'
+        r'(?P<thk>\d+(?:[\.,]\d+)?)\s*["”]\s*'
+        r'(?P<wid>\d+(?:[\.,]\d+)?)\s*["”]\s*'
+        r'(?P<len>\d+(?:[\.,]\d+)?)\s*["”]\s*$'
+    )
+    lot_pat = re.compile(r'\bLOT\s*#?\s*:\s*([A-Za-z0-9\-]+)', re.IGNORECASE)
+    qty_pat = re.compile(r'\bQTY\s*:\s*([\d,]+)', re.IGNORECASE)
+
+    def dim_to_int(value: str) -> str:
+        value = str(value).strip().replace(',', '.')
+        try:
+            return str(int(round(float(value))))
+        except Exception:
+            return ""
+
+    def grade_from_description(text: str) -> str:
+        up = " ".join(str(text).upper().split())
+
+        if re.search(r'\bAPG\b', up):
+            return "APG"
+
+        if re.search(r'\b3\s*COM\b|\b3COM\b|\bIII/V\b|\bIII\b', up):
+            return "3COM"
+
+        if re.search(r'\bD[-\s]?GRADE\b|\bGRADE[-\s]?D\b', up):
+            return "D-GRADE"
+
+        if re.search(r'\bFB\b|\bDOG\b|\bFENCE\b', up):
+            return "FB"
+
+        return up.strip()
+
+    # Filename is the safest source when the trailer field is blank. If the
+    # filename is not a container number, fall back to the document text.
+    filename_match = re.search(r'\b([A-Z]{4}\d{7})\b', (pdf_name or '').upper())
+    full_text = "\n".join(pages_text)
+    text_match = re.search(r'\b([A-Z]{4}\d{7})\b', full_text.upper())
+    container = (
+        filename_match.group(1)
+        if filename_match
+        else (text_match.group(1) if text_match else "")
+    )
+
+    # These tickets show the reload/vendor PO, not the internal Sales Assist
+    # order number. In the full-match workflow, ORDERNUMBER comes from the
+    # uploaded container Excel, so leave this blank rather than using a Lot#
+    # or the vendor PO as an incorrect order number.
+    order = ""
+
+    lines = []
+    for page_num, text in enumerate(pages_text, start=1):
+        for line_num, line in enumerate((text or "").splitlines(), start=1):
+            cleaned = clean_pdf_line(line)
+            if cleaned:
+                lines.append((page_num, line_num, cleaned))
+
+    rows = []
+    current_item = None
+    i = 0
+
+    while i < len(lines):
+        page_num, line_num, line = lines[i]
+        dim_match = dim_pat.match(line)
+
+        if dim_match:
+            thk = dim_to_int(dim_match.group('thk'))
+            wid = dim_to_int(dim_match.group('wid'))
+            leng = dim_to_int(dim_match.group('len'))
+
+            description_parts = []
+            j = i + 1
+
+            # The item description may wrap across several extracted lines.
+            # Stop before detail rows or the next item heading.
+            while j < len(lines) and j <= i + 8:
+                _, _, nxt = lines[j]
+                nxt_up = nxt.upper().strip()
+
+                if dim_pat.match(nxt) or lot_pat.search(nxt):
+                    break
+
+                if nxt_up in {"PALLET", "TOTALS :", "TOTALS:"}:
+                    break
+
+                # Ignore table values and generic header fragments.
+                if re.fullmatch(r'[\d,]+', nxt):
+                    j += 1
+                    continue
+
+                if nxt_up in {
+                    "SKU", "QUALIFIER", "ITEM DESCRIPTION", "INVENTORY",
+                    "INVENTORY QTY", "VARIABLE QTY", "CU FT", "LBS",
+                    "PACKED PER DIM UOM", "TOTAL QTY DIM UOM",
+                    "DIM UNIT OF MEASURE", "BLI",
+                }:
+                    j += 1
+                    continue
+
+                description_parts.append(nxt)
+                j += 1
+
+            grade = grade_from_description(" ".join(description_parts))
+
+            current_item = {
+                "GRADE": grade,
+                "THICKNESS": thk,
+                "WIDTH": wid,
+                "LENGTH": leng,
+            }
+
+            i += 1
+            continue
+
+        lot_match = lot_pat.search(line)
+
+        if lot_match and current_item is not None:
+            package_id = norm_id(lot_match.group(1))
+            pieces = ""
+
+            qty_match = qty_pat.search(line)
+            if qty_match:
+                pieces = norm_int_str(qty_match.group(1))
+
+            # PyPDF2 normally puts Qty on the following line. Scan only a few
+            # lines and stop if a new lot/item starts.
+            if not pieces:
+                for j in range(i + 1, min(i + 5, len(lines))):
+                    _, _, nxt = lines[j]
+
+                    if dim_pat.match(nxt) or lot_pat.search(nxt):
+                        break
+
+                    qty_match = qty_pat.search(nxt)
+                    if qty_match:
+                        pieces = norm_int_str(qty_match.group(1))
+                        break
+
+            if package_id and pieces:
+                thk = int(current_item["THICKNESS"])
+                wid = int(current_item["WIDTH"])
+                leng = int(current_item["LENGTH"])
+                pcs_int = int(pieces)
+                qty = int(round(pcs_int * (thk * wid * leng) / 144.0))
+
+                rows.append(
+                    {
+                        "PACKAGEID": package_id,
+                        "PCS": pcs_int,
+                        "QTY": qty,
+                        "GRADE": current_item["GRADE"],
+                        "THICKNESS": str(thk),
+                        "WIDTH": str(wid),
+                        "LENGTH": str(leng),
+                        "CONTAINER": container,
+                        "ORDERNUMBER": order,
+                        "PDF_FILE": pdf_name,
+                    }
+                )
+
+        i += 1
+
+    if not rows:
+        return []
+
+    # One physical lot should appear only once in a receipt. This also protects
+    # against PDF extraction occasionally repeating a line at a page boundary.
+    deduped = []
+    seen = set()
+
+    for row in rows:
+        key = (row["PDF_FILE"], row["PACKAGEID"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+
+    return deduped
+
+
+# ==================================================
+# Existing PDF Line Item Parser + New Format Dispatch
 # ==================================================
 def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
+    """
+    Parse all supported receipt formats.
+
+    Existing receipt parsing remains unchanged. The only addition is a format
+    check that routes Grane Laramie Receive Summary Tickets to their dedicated
+    parser, then returns the same output columns used by the existing app.
+    """
     dim_pat = re.compile(r"^\d+\s*[Xx]\s*\d+\s*[Xx]\s*\d+$")
     int_pat = re.compile(r"^\d+$")
 
@@ -271,6 +485,17 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
         pages_text = [(p.extract_text() or "") for p in reader.pages]
         full_text = "\n".join(pages_text)
 
+        if is_receive_summary_ticket(full_text):
+            rows.extend(
+                parse_receive_summary_ticket(
+                    pdf_name=pdf.name,
+                    pages_text=pages_text,
+                    package_id_whitelist=package_id_whitelist,
+                )
+            )
+            continue
+
+        # Legacy path below is intentionally unchanged.
         container, order = extract_container_and_order(full_text, pdf.name)
 
         for text in pages_text:
