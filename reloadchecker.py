@@ -237,15 +237,20 @@ def extract_container_and_order(full_text: str, filename: str):
 
 
 # ==================================================
-# Receive Summary Ticket Parser (Grane Laramie)
+# Grane Laramie Receive Summary Ticket Parser
+# Supports BOTH the original inch-formatted tickets and the newer
+# metric-formatted tickets without changing the legacy parser below.
 # ==================================================
-def is_receive_summary_ticket(full_text: str) -> bool:
-    """Identify the new Grane Laramie receive-summary layout."""
+def is_grane_receive_summary_ticket(full_text: str) -> bool:
     up = (full_text or "").upper()
-    return "RECEIVE SUMMARY TICKET" in up and "DETAILS:" in up and "LOT#:" in up
+    return (
+        "RECEIVE SUMMARY TICKET" in up
+        and "GRANE LARAMIE" in up
+        and "LOT#:" in up
+    )
 
 
-def parse_receive_summary_ticket(
+def parse_grane_receive_summary_ticket(
     pdf_name: str,
     pages_text,
     package_id_whitelist=None,
@@ -253,207 +258,354 @@ def parse_receive_summary_ticket(
     """
     Parse Birmingham International / Grane Laramie Receive Summary Tickets.
 
-    The item dimensions and grade are printed once, followed by one or more
-    detail rows. Each detail row becomes one normal import-generator row:
+    Supported item dimension layouts:
 
-      PACKAGEID = Lot#
-      PCS       = detail Qty
-      QTY       = board feet calculated from PCS and dimensions
+      Original format:
+        1,0" 6,0" 96"
 
-    Item context is kept across page breaks because some receipts continue a
-    detail group on the following page before printing the next item heading.
+      New metric format (PyPDF2 may split the number/unit onto separate lines):
+        15,0 mm
+        140,0 mm
+        1,220 m
+
+        or
+
+        15,0 mm
+        140,0 mm
+        1,830 mm
+
+    The metric dimensions are converted to the nominal inch dimensions used by
+    the container list / SKU lookup. For the current receipts this converts:
+
+      15 mm x 140 mm x 1.220 m -> 1 x 6 x 48
+      15 mm x 140 mm x 1,830 mm -> 1 x 6 x 72
+      15 mm x 140 mm x 2,440 mm -> 1 x 6 x 96
+
+    Each Lot# is returned as PACKAGEID and its Qty is returned as PCS.
+
+    Important: some new receipts repeat the same Lot# on multiple pallet rows
+    (for example two 120-piece pallets for one 240-piece lot). Those repeated
+    physical pallet rows are summed by Lot# so PCS matches the container list.
+    Exact duplicate PDF extraction rows (same lot + pallet + qty) are ignored.
     """
-    dim_pat = re.compile(
-        r'^\s*'
+
+    imperial_dim_pat = re.compile(
         r'(?P<thk>\d+(?:[\.,]\d+)?)\s*["”]\s*'
         r'(?P<wid>\d+(?:[\.,]\d+)?)\s*["”]\s*'
-        r'(?P<len>\d+(?:[\.,]\d+)?)\s*["”]\s*$'
+        r'(?P<len>\d+(?:[\.,]\d+)?)\s*["”]',
+        re.IGNORECASE,
     )
+
+    metric_measure_pat = re.compile(
+        r'(?<!\d)(?P<value>\d+(?:[\.,]\d+)?)\s*(?P<unit>mm|m)\b',
+        re.IGNORECASE,
+    )
+
     lot_pat = re.compile(r'\bLOT\s*#?\s*:\s*([A-Za-z0-9\-]+)', re.IGNORECASE)
     qty_pat = re.compile(r'\bQTY\s*:\s*([\d,]+)', re.IGNORECASE)
+    pallet_pat = re.compile(r'\bPALLET\s*:\s*([A-Za-z0-9\-]+)', re.IGNORECASE)
 
-    def dim_to_int(value: str) -> str:
-        value = str(value).strip().replace(',', '.')
+    def number_to_float(value: str):
         try:
-            return str(int(round(float(value))))
+            return float(str(value).strip().replace(",", "."))
+        except Exception:
+            return None
+
+    def imperial_to_int(value: str) -> str:
+        v = number_to_float(value)
+        if v is None:
+            return ""
+        return str(int(round(v)))
+
+    def metric_to_mm(raw_value: str, unit: str):
+        """Convert an extracted metric token to millimeters."""
+        raw = str(raw_value).strip()
+        unit = str(unit).strip().lower()
+
+        if unit == "m":
+            # 1,220 m means 1.220 meters on these receipts.
+            try:
+                return float(raw.replace(",", ".")) * 1000.0
+            except Exception:
+                return None
+
+        # In millimeters, values such as 1,830 and 2,440 represent
+        # 1,830 mm / 2,440 mm, while 15,0 and 140,0 are decimal values.
+        if re.fullmatch(r"\d{1,2},\d{3}", raw):
+            try:
+                return float(raw.replace(",", ""))
+            except Exception:
+                return None
+
+        try:
+            return float(raw.replace(",", "."))
+        except Exception:
+            return None
+
+    def mm_to_nominal_in(mm_value) -> str:
+        if mm_value is None:
+            return ""
+        try:
+            # These receipts contain actual metric measurements while the
+            # container/SKU files use nominal inch dimensions.
+            return str(max(1, int(round(float(mm_value) / 25.4))))
         except Exception:
             return ""
 
     def grade_from_description(text: str) -> str:
         up = " ".join(str(text).upper().split())
 
-        if re.search(r'\bAPG\b', up):
+        if "FENCE" in up or "DOG EAR" in up or re.search(r"\bFB\b", up):
+            return "FENCE"
+
+        if re.search(r"\bAPG\b", up):
             return "APG"
 
-        if re.search(r'\b3\s*COM\b|\b3COM\b|\bIII/V\b|\bIII\b', up):
+        if re.search(r"\b3\s*COM\b|\b3COM\b|\bIII/V\b|\bIII\b", up):
             return "3COM"
 
-        if re.search(r'\bD[-\s]?GRADE\b|\bGRADE[-\s]?D\b', up):
+        if re.search(r"\bD[-\s]?GRADE\b|\bGRADE[-\s]?D\b", up):
             return "D-GRADE"
-
-        if re.search(r'\bFB\b|\bDOG\b|\bFENCE\b', up):
-            return "FB"
 
         return up.strip()
 
-    # Filename is the safest source when the trailer field is blank. If the
-    # filename is not a container number, fall back to the document text.
-    filename_match = re.search(r'\b([A-Z]{4}\d{7})\b', (pdf_name or '').upper())
-    full_text = "\n".join(pages_text)
-    text_match = re.search(r'\b([A-Z]{4}\d{7})\b', full_text.upper())
-    container = (
-        filename_match.group(1)
-        if filename_match
-        else (text_match.group(1) if text_match else "")
-    )
+    def find_container() -> str:
+        # Prefer filename because some new tickets leave Trailer/Container blank.
+        m = re.search(r"\b([A-Z]{4}\d{6,7})\b", (pdf_name or "").upper())
+        if m:
+            return m.group(1)
 
-    # These tickets show the reload/vendor PO, not the internal Sales Assist
-    # order number. In the full-match workflow, ORDERNUMBER comes from the
-    # uploaded container Excel, so leave this blank rather than using a Lot#
-    # or the vendor PO as an incorrect order number.
+        full_text = "\n".join(pages_text)
+
+        # Try the labeled field first, then a general container-looking token.
+        m = re.search(
+            r"TRAILER\s*/\s*CONTAINER\s*#?\s*:\s*([A-Z]{4}\d{6,7})",
+            full_text.upper(),
+        )
+        if m:
+            return m.group(1)
+
+        m = re.search(r"\b([A-Z]{4}\d{6,7})\b", full_text.upper())
+        return m.group(1) if m else ""
+
+    def metric_item_from_description(lines, idx, description_text):
+        # The metric dimensions immediately precede the product description,
+        # but PyPDF2 often splits numbers and units across separate lines.
+        # Joining the preceding lines lets one regex handle both forms.
+        start = max(0, idx - 25)
+        context = " ".join(lines[start:idx + 1])
+        measurements = []
+
+        for m in metric_measure_pat.finditer(context):
+            mm = metric_to_mm(m.group("value"), m.group("unit"))
+            if mm is not None:
+                measurements.append(mm)
+
+        if len(measurements) < 3:
+            return None
+
+        # The last three metric measurements before the description are the
+        # thickness, width and length for the current item.
+        thk_mm, wid_mm, len_mm = measurements[-3:]
+
+        thk = mm_to_nominal_in(thk_mm)
+        wid = mm_to_nominal_in(wid_mm)
+        leng = mm_to_nominal_in(len_mm)
+
+        if not thk or not wid or not leng:
+            return None
+
+        return {
+            "GRADE": grade_from_description(description_text),
+            "THICKNESS": thk,
+            "WIDTH": wid,
+            "LENGTH": leng,
+        }
+
+    container = find_container()
+
+    # These receipts show the reload/vendor PO (20-1805288), not the internal
+    # Sales Assist order number. The full-match workflow keeps ORDERNUMBER from
+    # the uploaded container Excel, so do not manufacture an order from the PDF.
     order = ""
 
+    # Keep page order but treat the receipt as one continuous stream so item
+    # context survives page breaks.
     lines = []
-    for page_num, text in enumerate(pages_text, start=1):
-        for line_num, line in enumerate((text or "").splitlines(), start=1):
+    for text in pages_text:
+        for line in (text or "").splitlines():
             cleaned = clean_pdf_line(line)
             if cleaned:
-                lines.append((page_num, line_num, cleaned))
+                lines.append(cleaned)
 
-    rows = []
     current_item = None
+    occurrence_rows = []
+    seen_occurrences = set()
+
     i = 0
-
     while i < len(lines):
-        page_num, line_num, line = lines[i]
-        dim_match = dim_pat.match(line)
+        line = lines[i]
 
+        # --------------------------------------------------------------
+        # Original Grane inch format: 1,0" 6,0" 96"
+        # --------------------------------------------------------------
+        dim_match = imperial_dim_pat.search(line)
         if dim_match:
-            thk = dim_to_int(dim_match.group('thk'))
-            wid = dim_to_int(dim_match.group('wid'))
-            leng = dim_to_int(dim_match.group('len'))
+            thk = imperial_to_int(dim_match.group("thk"))
+            wid = imperial_to_int(dim_match.group("wid"))
+            leng = imperial_to_int(dim_match.group("len"))
 
             description_parts = []
-            j = i + 1
-
-            # The item description may wrap across several extracted lines.
-            # Stop before detail rows or the next item heading.
-            while j < len(lines) and j <= i + 8:
-                _, _, nxt = lines[j]
-                nxt_up = nxt.upper().strip()
-
-                if dim_pat.match(nxt) or lot_pat.search(nxt):
+            for j in range(i + 1, min(i + 8, len(lines))):
+                nxt = lines[j]
+                if lot_pat.search(nxt) or imperial_dim_pat.search(nxt):
+                    break
+                if nxt.upper().strip() == "PALLET":
+                    break
+                if "TIMBER" in nxt.upper() or "TAEDA-PINE" in nxt.upper():
+                    description_parts.append(nxt)
+                    # The grade keyword is normally on this line.
                     break
 
-                if nxt_up in {"PALLET", "TOTALS :", "TOTALS:"}:
-                    break
-
-                # Ignore table values and generic header fragments.
-                if re.fullmatch(r'[\d,]+', nxt):
-                    j += 1
-                    continue
-
-                if nxt_up in {
-                    "SKU", "QUALIFIER", "ITEM DESCRIPTION", "INVENTORY",
-                    "INVENTORY QTY", "VARIABLE QTY", "CU FT", "LBS",
-                    "PACKED PER DIM UOM", "TOTAL QTY DIM UOM",
-                    "DIM UNIT OF MEASURE", "BLI",
-                }:
-                    j += 1
-                    continue
-
-                description_parts.append(nxt)
-                j += 1
-
-            grade = grade_from_description(" ".join(description_parts))
-
-            current_item = {
-                "GRADE": grade,
-                "THICKNESS": thk,
-                "WIDTH": wid,
-                "LENGTH": leng,
-            }
+            if thk and wid and leng:
+                current_item = {
+                    "GRADE": grade_from_description(" ".join(description_parts)),
+                    "THICKNESS": thk,
+                    "WIDTH": wid,
+                    "LENGTH": leng,
+                }
 
             i += 1
             continue
 
-        lot_match = lot_pat.search(line)
+        # --------------------------------------------------------------
+        # New Grane metric format. The product description is the most
+        # reliable anchor because number/unit tokens are split into lines.
+        # --------------------------------------------------------------
+        line_up = line.upper()
+        if "TAEDA-PINE" in line_up and (
+            "TIMBER" in line_up or "FENCE" in line_up or "APG" in line_up
+        ):
+            # Include a following wrapped description line when present.
+            desc = line
+            if i + 1 < len(lines):
+                nxt_up = lines[i + 1].upper()
+                if (
+                    not lot_pat.search(lines[i + 1])
+                    and nxt_up not in {"PALLET", "SKU", "QUALIFIER"}
+                    and not imperial_dim_pat.search(lines[i + 1])
+                    and "PRINTED ON" not in nxt_up
+                ):
+                    # Usually this is simply "not tied" / "BLI".
+                    desc = desc + " " + lines[i + 1]
 
+            metric_item = metric_item_from_description(lines, i, desc)
+            if metric_item is not None:
+                current_item = metric_item
+
+        # --------------------------------------------------------------
+        # Detail row: Lot# + optional Pallet + Qty
+        # --------------------------------------------------------------
+        lot_match = lot_pat.search(line)
         if lot_match and current_item is not None:
             package_id = norm_id(lot_match.group(1))
             pieces = ""
+            pallet = ""
 
             qty_match = qty_pat.search(line)
             if qty_match:
                 pieces = norm_int_str(qty_match.group(1))
 
-            # PyPDF2 normally puts Qty on the following line. Scan only a few
-            # lines and stop if a new lot/item starts.
-            if not pieces:
-                for j in range(i + 1, min(i + 5, len(lines))):
-                    _, _, nxt = lines[j]
+            pallet_match = pallet_pat.search(line)
+            if pallet_match:
+                pallet = norm_id(pallet_match.group(1))
 
-                    if dim_pat.match(nxt) or lot_pat.search(nxt):
-                        break
+            # New tickets typically extract as Lot#, Pallet, Qty on 3 lines;
+            # older tickets often put Qty on the immediately following line.
+            for j in range(i + 1, min(i + 7, len(lines))):
+                nxt = lines[j]
 
-                    qty_match = qty_pat.search(nxt)
-                    if qty_match:
-                        pieces = norm_int_str(qty_match.group(1))
-                        break
+                if lot_pat.search(nxt) or imperial_dim_pat.search(nxt):
+                    break
+
+                if not pallet:
+                    pm = pallet_pat.search(nxt)
+                    if pm:
+                        pallet = norm_id(pm.group(1))
+
+                if not pieces:
+                    qm = qty_pat.search(nxt)
+                    if qm:
+                        pieces = norm_int_str(qm.group(1))
+
+                if pieces and pallet:
+                    break
 
             if package_id and pieces:
-                thk = int(current_item["THICKNESS"])
-                wid = int(current_item["WIDTH"])
-                leng = int(current_item["LENGTH"])
-                pcs_int = int(pieces)
-                qty = int(round(pcs_int * (thk * wid * leng) / 144.0))
-
-                rows.append(
-                    {
-                        "PACKAGEID": package_id,
-                        "PCS": pcs_int,
-                        "QTY": qty,
-                        "GRADE": current_item["GRADE"],
-                        "THICKNESS": str(thk),
-                        "WIDTH": str(wid),
-                        "LENGTH": str(leng),
-                        "CONTAINER": container,
-                        "ORDERNUMBER": order,
-                        "PDF_FILE": pdf_name,
-                    }
+                occurrence_key = (
+                    package_id,
+                    pallet,
+                    pieces,
+                    current_item["THICKNESS"],
+                    current_item["WIDTH"],
+                    current_item["LENGTH"],
                 )
+
+                # Ignore exact duplicated extraction rows, but keep repeated
+                # Lot# rows when they have different pallet numbers because
+                # those are real split pallets whose PCS must be summed.
+                if occurrence_key not in seen_occurrences:
+                    seen_occurrences.add(occurrence_key)
+                    occurrence_rows.append(
+                        {
+                            "PACKAGEID": package_id,
+                            "PCS": int(pieces),
+                            "GRADE": current_item["GRADE"],
+                            "THICKNESS": current_item["THICKNESS"],
+                            "WIDTH": current_item["WIDTH"],
+                            "LENGTH": current_item["LENGTH"],
+                            "CONTAINER": container,
+                            "ORDERNUMBER": order,
+                            "PDF_FILE": pdf_name,
+                        }
+                    )
 
         i += 1
 
-    if not rows:
+    if not occurrence_rows:
         return []
 
-    # One physical lot should appear only once in a receipt. This also protects
-    # against PDF extraction occasionally repeating a line at a page boundary.
-    deduped = []
-    seen = set()
+    # Aggregate repeated Lot# pallet rows. This is required for receipts such
+    # as MSBU8704396 where one container PACKAGEID is represented by two
+    # 120-piece pallet rows but the container list correctly shows PCS=240.
+    aggregated = {}
 
-    for row in rows:
-        key = (row["PDF_FILE"], row["PACKAGEID"])
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(row)
+    for row in occurrence_rows:
+        package_id = row["PACKAGEID"]
 
-    return deduped
+        if package_id not in aggregated:
+            aggregated[package_id] = row.copy()
+        else:
+            aggregated[package_id]["PCS"] += int(row["PCS"])
+
+    final_rows = []
+
+    for row in aggregated.values():
+        thk = int(row["THICKNESS"])
+        wid = int(row["WIDTH"])
+        leng = int(row["LENGTH"])
+        pieces = int(row["PCS"])
+
+        row["QTY"] = int(round(pieces * (thk * wid * leng) / 144.0))
+        final_rows.append(row)
+
+    return final_rows
 
 
 # ==================================================
-# Existing PDF Line Item Parser + New Format Dispatch
+# Existing PDF Line Item Parser
 # ==================================================
 def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
-    """
-    Parse all supported receipt formats.
-
-    Existing receipt parsing remains unchanged. The only addition is a format
-    check that routes Grane Laramie Receive Summary Tickets to their dedicated
-    parser, then returns the same output columns used by the existing app.
-    """
     dim_pat = re.compile(r"^\d+\s*[Xx]\s*\d+\s*[Xx]\s*\d+$")
     int_pat = re.compile(r"^\d+$")
 
@@ -485,9 +637,10 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
         pages_text = [(p.extract_text() or "") for p in reader.pages]
         full_text = "\n".join(pages_text)
 
-        if is_receive_summary_ticket(full_text):
+        # New format dispatch only. Legacy parsing below remains unchanged.
+        if is_grane_receive_summary_ticket(full_text):
             rows.extend(
-                parse_receive_summary_ticket(
+                parse_grane_receive_summary_ticket(
                     pdf_name=pdf.name,
                     pages_text=pages_text,
                     package_id_whitelist=package_id_whitelist,
@@ -495,7 +648,6 @@ def parse_pdfs_line_items(pdf_files, package_id_whitelist=None) -> pd.DataFrame:
             )
             continue
 
-        # Legacy path below is intentionally unchanged.
         container, order = extract_container_and_order(full_text, pdf.name)
 
         for text in pages_text:
